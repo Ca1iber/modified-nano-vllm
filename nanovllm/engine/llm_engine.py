@@ -10,6 +10,12 @@ from nanovllm.sampling_params import SamplingParams
 from nanovllm.engine.sequence import Sequence
 from nanovllm.engine.scheduler import Scheduler
 from nanovllm.engine.model_runner import ModelRunner
+from nanovllm.engine.stats import (
+    EngineMetricsSummary,
+    EngineStats,
+    RequestMetrics,
+    StepMetrics,
+)
 
 
 class LLMEngine:
@@ -32,7 +38,8 @@ class LLMEngine:
         self.model_runner = ModelRunner(config, 0, self.events)
         self.tokenizer = AutoTokenizer.from_pretrained(config.model, use_fast=True)
         config.eos = self.tokenizer.eos_token_id
-        self.scheduler = Scheduler(config)
+        self.stats = EngineStats() if config.enable_stats else None
+        self.scheduler = Scheduler(config, stats=self.stats)
         atexit.register(self.exit)
 
     # 清理多进程和 GPU 资源
@@ -52,23 +59,62 @@ class LLMEngine:
 
     # 完成一个调度、模型执行和状态更新
     def step(self):
+        if self.stats is not None:
+            self.stats.begin_step()
+        # Step 的计时范围从 schedule() 前开始，到 postprocess() 完成后结束。
+        step_start_time = self.stats.clock() if self.stats is not None else None
         # 本轮选择哪些请求
         # 本轮被选中执行的 Sequence 列表，本轮是 prefill 还是 decode
         seqs, is_prefill = self.scheduler.schedule()
-        # 统计本轮处理的 token 数
-        num_tokens = sum(seq.num_scheduled_tokens for seq in seqs) if is_prefill else -len(seqs)
+        # StepMetrics 中 token 数始终使用正数；Prefill 累加本轮各请求的 chunk，
+        # Decode 则是每个被调度请求各计算一个 token。
+        num_step_tokens = (
+            sum(seq.num_scheduled_tokens for seq in seqs)
+            if is_prefill
+            else len(seqs)
+        )
         # 执行模型并采样新 token
         token_ids = self.model_runner.call("run", seqs, is_prefill)
         # 更新 Sequence 状态
         self.scheduler.postprocess(seqs, token_ids, is_prefill)
+        if self.stats is not None:
+            block_manager = self.scheduler.block_manager
+            self.stats.record_step(
+                start_time=step_start_time,
+                is_prefill=is_prefill,
+                num_seqs=len(seqs),
+                num_tokens=num_step_tokens,
+                # 快照口径固定为 postprocess 完成后的物理 KV Block 状态。
+                used_kv_blocks=len(block_manager.used_block_ids),
+                free_kv_blocks=len(block_manager.free_block_ids),
+            )
         # 返回本轮刚完成的请求
         outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        # num_tokens 只是为了计算 prefill 和 decode 吞吐
-        return outputs, num_tokens
+        # 保留旧返回约定：Prefill 为正、Decode 为负，供 generate() 区分进度条吞吐。
+        returned_num_tokens = num_step_tokens if is_prefill else -num_step_tokens
+        return outputs, returned_num_tokens
 
     # 判断所有请求是否结束
     def is_finished(self):
         return self.scheduler.is_finished()
+
+    # 返回最近一批请求的时间线；enable_stats=False 时返回空字典。
+    def get_request_metrics(self) -> dict[int, RequestMetrics]:
+        if self.stats is None:
+            return {}
+        return dict(self.stats.requests)
+
+    # 返回最近一批生成中按执行顺序保存的每轮 StepMetrics。
+    def get_step_metrics(self) -> list[StepMetrics]:
+        if self.stats is None:
+            return []
+        return list(self.stats.steps)
+
+    # 汇总最近一批请求的百分位延迟和缓存事件；统计关闭时不构造空报告。
+    def get_metrics_summary(self) -> EngineMetricsSummary | None:
+        if self.stats is None:
+            return None
+        return self.stats.summarize()
 
     # 驱动整个生成循环并整理结果
     def generate(
@@ -78,6 +124,10 @@ class LLMEngine:
         use_tqdm: bool = True,
     ) -> list[str]:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
+        # 常规 generate 在空闲引擎上开始一批新请求，此时清掉上一批的统计数据。
+        # 若调用者已经手动 add_request，则保留那些已登记但尚未完成的请求。
+        if self.stats is not None and self.scheduler.is_finished():
+            self.stats.reset()
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):

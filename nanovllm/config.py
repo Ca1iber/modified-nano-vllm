@@ -12,6 +12,8 @@ class Config:
     gpu_memory_utilization: float = 0.9
     tensor_parallel_size: int = 1
     enforce_eager: bool = False
+    # 默认关闭请求计时，避免统计功能给原有推理路径增加不必要的开销。
+    enable_stats: bool = False
     hf_config: AutoConfig | None = None
     eos: int = -1
     kvcache_block_size: int = 256

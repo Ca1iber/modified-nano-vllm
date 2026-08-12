@@ -3,16 +3,19 @@ from collections import deque
 from nanovllm.config import Config
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
+from nanovllm.engine.stats import EngineStats
 
 
 class Scheduler:
 
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, stats: EngineStats | None = None):
         self.max_num_seqs = config.max_num_seqs
         self.max_num_batched_tokens = config.max_num_batched_tokens
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        # stats=None 时所有调度和状态转换都沿用原来的路径，不产生计时开销。
+        self.stats = stats
         # 创建一个装 Sequence 类型的双端队列，可高效从左右两端添加和删除
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
@@ -22,6 +25,9 @@ class Scheduler:
 
     def add(self, seq: Sequence):
         self.waiting.append(seq)
+        if self.stats is not None:
+            # arrival 的口径是“成功进入 Scheduler.waiting”，不包含 tokenizer 时间。
+            self.stats.record_arrival(seq.seq_id)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
         # scheduled_seqs = 当前step具体让谁上GPU
@@ -45,8 +51,22 @@ class Scheduler:
                 break
             if not seq.block_table:
                 self.block_manager.allocate(seq, num_cached_blocks)
+                if self.stats is not None:
+                    self.stats.record_prefix_cache_hit(
+                        seq.seq_id,
+                        num_blocks=num_cached_blocks,
+                        block_size=self.block_size,
+                    )
+            scheduled_start = seq.num_cached_tokens
             seq.num_scheduled_tokens = min(num_tokens, remaining)
             num_batched_tokens += seq.num_scheduled_tokens
+            if self.stats is not None:
+                # 普通 Prefill 的历史计算边界为 0，因此不会被误记为 Recompute。
+                self.stats.record_recompute(
+                    seq.seq_id,
+                    scheduled_start=scheduled_start,
+                    num_scheduled_tokens=seq.num_scheduled_tokens,
+                )
             # 判断本次 prefill 能否全部完成
             if seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens:
                 seq.status = SequenceStatus.RUNNING
@@ -55,6 +75,9 @@ class Scheduler:
             scheduled_seqs.append(seq)
 
         if scheduled_seqs:
+            if self.stats is not None:
+                # 以 scheduled_seqs 为准；未完成的 Chunked Prefill 也算真正被调度。
+                self.stats.record_scheduled([seq.seq_id for seq in scheduled_seqs])
             return scheduled_seqs, True
 
         # decode
@@ -75,13 +98,30 @@ class Scheduler:
                 scheduled_seqs.append(seq)
         assert scheduled_seqs
         self.running.extendleft(reversed(scheduled_seqs))
+        if self.stats is not None:
+            self.stats.record_scheduled([seq.seq_id for seq in scheduled_seqs])
         return scheduled_seqs, False
 
     def preempt(self, seq: Sequence):
+        if self.stats is not None:
+            cached_tokens = seq.num_cached_tokens
+            released_block_references = len(seq.block_table)
+            num_free_blocks_before = len(self.block_manager.free_block_ids)
         seq.status = SequenceStatus.WAITING
         seq.is_prefill = True
         self.block_manager.deallocate(seq)
         self.waiting.appendleft(seq)
+        if self.stats is not None:
+            # 共享 Block 只降低 ref_count；只有进入 free 队列的才算真正释放。
+            freed_physical_blocks = (
+                len(self.block_manager.free_block_ids) - num_free_blocks_before
+            )
+            self.stats.record_preemption(
+                seq.seq_id,
+                cached_tokens=cached_tokens,
+                released_block_references=released_block_references,
+                freed_physical_blocks=freed_physical_blocks,
+            )
 
     # ModelRunner 完成本轮计算后，把结果写回各个 Sequence，并更新调度状态。
     '''
@@ -100,7 +140,15 @@ class Scheduler:
             if is_prefill and seq.num_cached_tokens < seq.num_tokens:
                 continue
             seq.append_token(token_id)
-            if (not seq.ignore_eos and token_id == self.eos) or seq.num_completion_tokens == seq.max_tokens:
+            finished = (
+                (not seq.ignore_eos and token_id == self.eos)
+                or seq.num_completion_tokens == seq.max_tokens
+            )
+            if finished:
                 seq.status = SequenceStatus.FINISHED
+            if self.stats is not None:
+                # 只有 append_token 后才是真实输出；不完整 Prefill 的临时候选不会走到这里。
+                self.stats.record_output_token(seq.seq_id, finished=finished)
+            if finished:
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
