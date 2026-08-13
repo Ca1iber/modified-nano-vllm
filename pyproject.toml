@@ -27,6 +27,11 @@ test = [
 [project.urls]
 Homepage="https://github.com/GeeeekExplorer/nano-vllm"
 
+[tool.pytest.ini_options]
+markers = [
+    "gpu: 需要显式开启并使用真实 CUDA GPU 的正确性测试，部分测试还需本地模型",
+]
+
 [tool.setuptools.packages.find]
 where = ["."]
 include = ["nanovllm*"]

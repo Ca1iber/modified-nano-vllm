@@ -10,6 +10,9 @@
 - 已完成 P0.3a RequestMetrics、P0.3b StepMetrics、P0.3c
   preemption/recompute 与 KV Cache 指标，以及 P0.3d 百分位汇总和 benchmark
   报告接口。
+- 已完成当前单 GPU 环境可验收的 P0.2 正确性测试：Eager/CUDA Graph、
+  Prefix Cache 命中/不命中对照和跨 Block KV slot 正确性。P0.2d TP=1/TP=2
+  对照因长期只有单 GPU 标记为受阻的分布式扩展项，不纳入本轮验收。
 - 下一项：P0.4 可复现 workload。
 - 顺序调整：按 2026-08-01 的决定先完成 P0.3，P0.2 GPU 正确性测试仍保留在计划中。
 - 当前定位：约 1200 行的离线推理教学实现，不以完整复刻生产 vLLM 为目标。
@@ -48,19 +51,78 @@
 - 命令：`bash tests/run.sh all -q`。
 - 结果：`17 passed`；测试不加载模型、不需要 GPU。
 
-### `[ ]` P0.2 GPU 正确性测试
+### `[x]` P0.2 单 GPU 正确性测试
 
 覆盖：
 
 - Eager 与 CUDA Graph 输出一致。
 - Prefix Cache 命中与不命中生成结果一致。
-- TP=1 与 TP=2 在确定性采样下结果一致。
+- TP=1 与 TP=2 在确定性采样下结果一致（双 GPU 扩展验收项）。
 - KV slot 映射跨 block 边界正确。
 
 验收：
 
 - 固定模型、prompt、seed 和容差。
 - GPU 不可用时测试明确 skip，而不是静默通过。
+
+实施拆分：
+
+- `[x]` P0.2a：Eager 与 CUDA Graph 的确定性输出一致性。
+- `[x]` P0.2b：Prefix Cache 命中与不命中生成结果一致。
+- `[x]` P0.2c：KV slot 映射跨 Block 边界正确。
+- `[!]` P0.2d：TP=1 与 TP=2 在确定性采样下结果一致；当前项目
+  环境长期只有单张 RTX 3060，无法启动 rank 1 所需的 `cuda:1`，因此
+  不伪造双卡验证，不纳入本轮 P0.2 单 GPU 验收。
+
+P0.2a 完成证据：
+
+- 日期：2026-08-12。
+- 状态：已在 RTX 3060 上完成实际 GPU 验证。
+- 隔离变量：两个独立子进程使用相同模型、固定 token Prompt 和测试专用 argmax；
+  唯一区别是 `enforce_eager=True/False`，不会把随机采样差异误判为 Graph 错误。
+- 覆盖范围：三个请求分别输出 8、6、4 个 token；Prefill 后的 Decode batch 依次
+  经历 3→2→1，覆盖 CUDA Graph bucket 4/2/1 以及 padding 后 metadata 更新。
+- 运行保护：未设置 `NANOVLLM_RUN_GPU_TESTS=1`、CUDA 不可用或模型目录不存在时，
+  pytest 都会给出明确 skip 原因；普通 CPU 回归不会意外加载模型。
+- GPU 命令：`NANOVLLM_RUN_GPU_TESTS=1 NANOVLLM_TEST_MODEL=~/huggingface/Qwen3-0.6B bash tests/run.sh test_gpu_correctness`。
+- GPU 结果：`1 passed in 26.81s`；Eager 与 CUDA Graph 三个请求的 token ID 序列
+  逐项完全相同，输出长度均为 8、6、4。
+- 本地非 GPU 验证：当时完整回归 `44 passed, 1 skipped`；显式开启 GPU 测试但 CUDA
+  不可见时，skip 原因为“当前环境没有可用 CUDA GPU”；语法和差异检查通过。
+
+P0.2b 完成证据：
+
+- 日期：2026-08-12。
+- 状态：已在 RTX 3060 上完成实际 GPU 验证。
+- Miss 场景：在独立的干净 Eager 引擎中完整 Prefill 目标 Prompt，断言 Prefix Hit
+  为 0 Block/0 token。
+- Hit 场景：先运行一个共享 256-token 公共前缀、但尾部不同的 Primer；目标请求
+  随后复用 1 个完整 Block，并断言 Prefix Hit 为 1 Block/256 token。
+- 一致性口径：两边都使用测试专用 argmax，目标 Prompt 和 `max_tokens=4` 完全相同；
+  最终四个 token ID 必须逐项相同。Prefix 场景固定 `enforce_eager=True`，不混入
+  CUDA Graph 变量。
+- GPU 命令：`NANOVLLM_RUN_GPU_TESTS=1 NANOVLLM_TEST_MODEL=~/huggingface/Qwen3-0.6B bash tests/run.sh test_gpu_correctness -k prefix_cache`。
+- GPU 结果：`1 passed, 1 deselected in 21.76s`；Miss 组为 0 Block/0 token，Hit
+  组为 1 Block/256 token，两个场景生成的四个 token ID 逐项完全相同。
+- 本地非 GPU 验证：加入 P0.2b 后完整回归为 `44 passed, 2 skipped`；未显式开启和
+  CUDA 不可见两条路径均显示预期 skip 原因；Python 语法和差异检查通过。
+
+P0.2c 完成证据：
+
+- 日期：2026-08-13。
+- 状态：已在 RTX 3060 上完成实际 GPU 验证。
+- Prefill 场景：使用 `block_size=4`、`block_table=[7, 2]`，从逻辑位置 2
+  继续调度 4 个 token；断言 input/position 为位置 2～5，`slot_mapping`
+  为 `[30, 31, 8, 9]`，同时检查 `cu_seqlens` 和 `block_tables`。
+- Decode 场景：Sequence 从 4 token 增长到 5 token 后跨入新逻辑 Block，
+  断言最新 token 使用物理 Block 2 的首 slot 8，不会误按连续物理
+  Block 计算为 slot 32。
+- Kernel 场景：直接调用真实 Triton `store_kvcache()`，向 slot 30、31、8、9
+  写入四份可区分 K/V；通过整块 Tensor 严格相等检查，验证目标 slot
+  正确写入且所有其他 slot 保持为 0。
+- GPU 命令：`NANOVLLM_RUN_GPU_TESTS=1 bash tests/run.sh test_kv_slot_mapping -q -rs`。
+- GPU 结果：`3 passed in 4.48s`；本项不加载 Qwen 模型，因此不需要
+  `NANOVLLM_TEST_MODEL`。
 
 ### `[x]` P0.3 EngineStats 与请求时间线
 
