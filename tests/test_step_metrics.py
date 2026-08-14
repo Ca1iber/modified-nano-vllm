@@ -1,7 +1,10 @@
 from types import SimpleNamespace
 
+import pytest
+
 from nanovllm.engine.llm_engine import LLMEngine
 from nanovllm.engine.stats import EngineStats
+from nanovllm.sampling_params import SamplingParams
 
 
 class FakeClock:
@@ -81,6 +84,26 @@ def make_test_engine(
     engine.scheduler = scheduler
     engine.model_runner = model_runner
     return engine
+
+
+# 场景：动态 benchmark 在不同 Engine Step 分批调用 add_request()，必须记住每个
+# RequestSpec 最终对应哪个 Sequence，才能提取旧 Decode 请求和迟到 Prefill 请求的
+# 独立时间线。验证 add_request() 不仅把新 Sequence 交给 Scheduler，还返回同一个
+# seq_id；已有调用方忽略返回值时，原本的入队行为保持不变。
+def test_add_request_returns_the_scheduled_sequence_id():
+    added_seqs = []
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.tokenizer = SimpleNamespace(encode=lambda prompt: [10, 11])
+    engine.scheduler = SimpleNamespace(add=added_seqs.append)
+
+    seq_id = engine.add_request(
+        "prompt",
+        SamplingParams(ignore_eos=True, max_tokens=2),
+    )
+
+    assert len(added_seqs) == 1
+    assert added_seqs[0].prompt_token_ids == [10, 11]
+    assert seq_id == added_seqs[0].seq_id
 
 
 # 场景：一次 Prefill step 同时调度两个请求，本轮分别计算 4 和 2 个 prompt token。
@@ -256,3 +279,23 @@ def test_reset_clears_request_and_step_metrics():
 
     assert stats.requests == {}
     assert stats.steps == []
+
+
+# 场景：动态 benchmark 不走 generate()，需要显式划分正式统计批次。验证引擎空闲
+# 时 reset_metrics() 会清空旧请求和 Step；一旦 Scheduler 仍有 waiting/running 请求，
+# 就拒绝重置，避免把执行中的请求时间线删掉后让后续统计访问不存在的 seq_id。
+def test_engine_reset_metrics_requires_an_idle_scheduler():
+    stats = EngineStats()
+    stats.record_arrival(seq_id=0)
+    engine = LLMEngine.__new__(LLMEngine)
+    engine.stats = stats
+    engine.scheduler = SimpleNamespace(is_finished=lambda: True)
+
+    engine.reset_metrics()
+
+    assert stats.requests == {}
+    assert stats.steps == []
+
+    engine.scheduler = SimpleNamespace(is_finished=lambda: False)
+    with pytest.raises(RuntimeError, match="只能在引擎没有 waiting/running 请求时重置指标"):
+        engine.reset_metrics()

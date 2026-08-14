@@ -6,6 +6,8 @@ import json
 
 import torch
 
+from bench import build_sampling_params, run_setup_requests, run_target_requests
+from bench_workloads import build_workload_spec
 from nanovllm import LLM, SamplingParams
 from nanovllm.layers.sampler import Sampler
 
@@ -61,8 +63,22 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", required=True)
     parser.add_argument(
         "--mode",
-        choices=("eager", "cuda_graph", "prefix_miss", "prefix_hit"),
+        choices=(
+            "eager",
+            "cuda_graph",
+            "prefix_miss",
+            "prefix_hit",
+            "shared_prefix_workload",
+            "kv_pressure_relaxed",
+            "kv_pressure_tight",
+            "dynamic_arrival_workload",
+            "official_workload",
+        ),
         required=True,
+    )
+    parser.add_argument(
+        "--workload",
+        help="mode=official_workload 时要运行的 P0.4 workload 名称。",
     )
     return parser.parse_args()
 
@@ -115,32 +131,201 @@ def run_prefix_cache_scenario(llm: LLM, mode: str) -> dict:
     }
 
 
+def run_shared_prefix_workload(llm: LLM) -> dict:
+    """真实运行 P0.4b 的 1 Primer + 16 Target，并返回正式 Target 指标。"""
+    workload = build_workload_spec("shared_prefix_high_hit", seed=0)
+    run_setup_requests(llm, workload, SamplingParams)
+    target_params = build_sampling_params(workload.requests, SamplingParams)
+    outputs = run_target_requests(llm, workload, target_params)
+    metrics_summary = llm.get_metrics_summary()
+    assert metrics_summary is not None
+    return {
+        "mode": "shared_prefix_workload",
+        "request_count": metrics_summary.request_count,
+        "completed_request_count": metrics_summary.completed_request_count,
+        "output_lengths": [len(output["token_ids"]) for output in outputs],
+        "total_output_tokens": sum(len(output["token_ids"]) for output in outputs),
+        "prefix_hit_blocks": metrics_summary.total_prefix_hit_blocks,
+        "prefix_hit_tokens": metrics_summary.total_prefix_hit_tokens,
+    }
+
+
+def run_kv_pressure_scenario(llm: LLM, mode: str) -> dict:
+    """运行相同的两个请求，返回宽松/紧张 KV 容量下的输出和抢占指标。"""
+    workload = build_workload_spec("kv_pressure_preemption", seed=0)
+    target_params = build_sampling_params(workload.requests, SamplingParams)
+    outputs = run_target_requests(llm, workload, target_params)
+    metrics = llm.get_metrics_summary()
+    assert metrics is not None
+    block_manager = llm.scheduler.block_manager
+    return {
+        "mode": mode,
+        "token_ids": [output["token_ids"] for output in outputs],
+        "request_count": metrics.request_count,
+        "completed_request_count": metrics.completed_request_count,
+        "preemptions": metrics.total_preemptions,
+        "preempted_cached_tokens": metrics.total_preempted_cached_tokens,
+        "released_block_references": metrics.total_released_block_references,
+        "freed_physical_blocks": metrics.total_freed_physical_blocks,
+        "recompute_steps": metrics.total_recompute_steps,
+        "recomputed_tokens": metrics.total_recomputed_tokens,
+        "peak_used_kv_blocks": metrics.peak_used_kv_blocks,
+        "used_kv_blocks_after_finish": len(block_manager.used_block_ids),
+        "free_kv_blocks_after_finish": len(block_manager.free_block_ids),
+    }
+
+
+def run_dynamic_arrival_workload(llm: LLM) -> dict:
+    """真实运行 P0.4d，并返回到达前后 Step 顺序、输出和资源状态。"""
+    workload = build_workload_spec("decode_then_long_prefill", seed=0)
+    target_params = build_sampling_params(workload.requests, SamplingParams)
+    result = run_target_requests(llm, workload, target_params)
+    metrics = llm.get_metrics_summary()
+    assert metrics is not None
+    steps = llm.get_step_metrics()
+    request_metrics = llm.get_request_metrics()
+    arrival_time = result.arrival_step_times[9]
+    old_tokens_before_arrival = [
+        sum(
+            output_time <= arrival_time
+            for output_time in request_metrics[seq_id].output_token_times
+        )
+        for seq_id in result.request_seq_ids[:4]
+    ]
+    block_manager = llm.scheduler.block_manager
+    return {
+        "mode": "dynamic_arrival_workload",
+        "request_count": metrics.request_count,
+        "completed_request_count": metrics.completed_request_count,
+        "output_lengths": [len(output["token_ids"]) for output in result.outputs],
+        "request_seq_ids": result.request_seq_ids,
+        "old_tokens_before_arrival": old_tokens_before_arrival,
+        "step_is_prefill": [step.is_prefill for step in steps],
+        "step_num_seqs": [step.num_seqs for step in steps],
+        "step_num_tokens": [step.num_tokens for step in steps],
+        "preemptions": metrics.total_preemptions,
+        "recomputed_tokens": metrics.total_recomputed_tokens,
+        "peak_used_kv_blocks": metrics.peak_used_kv_blocks,
+        "used_kv_blocks_after_finish": len(block_manager.used_block_ids),
+        "free_kv_blocks_after_finish": len(block_manager.free_block_ids),
+    }
+
+
+def run_official_workload(llm: LLM, workload_name: str) -> dict:
+    """运行任意 P0.4 正式 workload，返回统一的 GPU 正确性字段。"""
+    workload = build_workload_spec(workload_name, seed=0)
+    run_setup_requests(llm, workload, SamplingParams)
+    target_params = build_sampling_params(workload.requests, SamplingParams)
+    result = run_target_requests(llm, workload, target_params)
+    metrics = llm.get_metrics_summary()
+    assert metrics is not None
+    steps = llm.get_step_metrics()
+    block_manager = llm.scheduler.block_manager
+    payload = {
+        "mode": "official_workload",
+        "workload": workload_name,
+        "request_count": metrics.request_count,
+        "completed_request_count": metrics.completed_request_count,
+        "expected_output_lengths": workload.output_lengths,
+        "output_lengths": [len(output["token_ids"]) for output in result.outputs],
+        "prefill_steps": metrics.prefill_step_count,
+        "decode_steps": metrics.decode_step_count,
+        "preemptions": metrics.total_preemptions,
+        "recomputed_tokens": metrics.total_recomputed_tokens,
+        "prefix_hit_blocks": metrics.total_prefix_hit_blocks,
+        "prefix_hit_tokens": metrics.total_prefix_hit_tokens,
+        "step_is_prefill": [step.is_prefill for step in steps],
+        "step_num_seqs": [step.num_seqs for step in steps],
+        "step_num_tokens": [step.num_tokens for step in steps],
+        "peak_used_kv_blocks": metrics.peak_used_kv_blocks,
+        "used_kv_blocks_after_finish": len(block_manager.used_block_ids),
+        "free_kv_blocks_after_finish": len(block_manager.free_block_ids),
+    }
+    if workload_name == "decode_then_long_prefill":
+        request_metrics = llm.get_request_metrics()
+        arrival_time = result.arrival_step_times[9]
+        payload["old_tokens_before_arrival"] = [
+            sum(
+                output_time <= arrival_time
+                for output_time in request_metrics[seq_id].output_token_times
+            )
+            for seq_id in result.request_seq_ids[:4]
+        ]
+    return payload
+
+
 def main() -> None:
     args = parse_args()
     # 只修改当前测试子进程中的 Sampler；正式 nano-vLLM 代码仍使用原有随机采样。
     Sampler.forward = deterministic_forward
 
-    is_prefix_scenario = args.mode.startswith("prefix_")
+    is_prefix_scenario = (
+        args.mode.startswith("prefix_")
+        or args.mode == "shared_prefix_workload"
+    )
+    is_shared_prefix_workload = args.mode == "shared_prefix_workload"
+    is_kv_pressure_scenario = args.mode.startswith("kv_pressure_")
+    is_dynamic_arrival_workload = args.mode == "dynamic_arrival_workload"
+    is_official_workload = args.mode == "official_workload"
+    if is_official_workload:
+        if args.workload is None:
+            raise ValueError("official_workload mode 必须提供 --workload")
+        official_spec = build_workload_spec(args.workload, seed=0)
+        num_kvcache_blocks = official_spec.num_kvcache_blocks
+    elif is_dynamic_arrival_workload:
+        num_kvcache_blocks = 9
+    elif is_kv_pressure_scenario:
+        num_kvcache_blocks = 2 if args.mode == "kv_pressure_tight" else 4
+    else:
+        num_kvcache_blocks = -1
+    if is_official_workload:
+        max_model_len = official_spec.max_model_len
+        max_num_batched_tokens = official_spec.max_num_batched_tokens
+        max_num_seqs = official_spec.max_num_seqs
+    elif is_dynamic_arrival_workload:
+        max_model_len, max_num_batched_tokens, max_num_seqs = 2048, 512, 8
+    elif is_shared_prefix_workload:
+        max_model_len, max_num_batched_tokens, max_num_seqs = 1024, 512, 16
+    elif is_kv_pressure_scenario:
+        max_model_len, max_num_batched_tokens, max_num_seqs = 512, 256, 2
+    elif is_prefix_scenario:
+        max_model_len, max_num_batched_tokens, max_num_seqs = 512, 512, 8
+    else:
+        max_model_len, max_num_batched_tokens, max_num_seqs = 256, 256, 8
     llm = LLM(
         args.model,
-        # Prefix Cache 测试固定使用 Eager，避免把 CUDA Graph 变成第二个变量。
-        enforce_eager=args.mode != "cuda_graph",
-        max_model_len=512 if is_prefix_scenario else 256,
-        max_num_batched_tokens=512 if is_prefix_scenario else 256,
+        # 统一 workload 验收走与正式 benchmark 相同的 CUDA Graph；原有 Prefix、
+        # KV 抢占和动态专项仍固定 Eager，继续隔离各自正在验证的状态变量。
+        enforce_eager=args.mode not in ("cuda_graph", "official_workload"),
+        max_model_len=max_model_len,
+        max_num_batched_tokens=max_num_batched_tokens,
         # 当前 CUDA Graph 固定提供 1/2/4/8 这几个小 batch bucket。
-        max_num_seqs=8,
+        max_num_seqs=max_num_seqs,
         # Prefix 测试通过指标证明 Hit 组确实走了缓存，而不是两边都完整 Prefill。
-        enable_stats=is_prefix_scenario,
+        enable_stats=(
+            is_prefix_scenario
+            or is_kv_pressure_scenario
+            or is_dynamic_arrival_workload
+            or is_official_workload
+        ),
+        num_kvcache_blocks=num_kvcache_blocks,
     )
     # LLMEngine 默认注册 atexit；worker 选择在 finally 中主动清理，因此先取消重复调用。
     atexit.unregister(llm.exit)
     try:
         torch.manual_seed(0)
-        payload = (
-            run_prefix_cache_scenario(llm, args.mode)
-            if is_prefix_scenario
-            else run_eager_graph_scenario(llm, args.mode)
-        )
+        if is_official_workload:
+            payload = run_official_workload(llm, args.workload)
+        elif is_dynamic_arrival_workload:
+            payload = run_dynamic_arrival_workload(llm)
+        elif is_shared_prefix_workload:
+            payload = run_shared_prefix_workload(llm)
+        elif is_kv_pressure_scenario:
+            payload = run_kv_pressure_scenario(llm, args.mode)
+        elif is_prefix_scenario:
+            payload = run_prefix_cache_scenario(llm, args.mode)
+        else:
+            payload = run_eager_graph_scenario(llm, args.mode)
     finally:
         llm.exit()
 

@@ -12,6 +12,22 @@ from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
 
 
+def resolve_num_kvcache_blocks(requested_blocks: int, available_blocks: int) -> int:
+    """将 -1 解析为自动容量；显式正整数不能超过当前 GPU 的安全容量。"""
+    if available_blocks <= 0:
+        raise ValueError("当前 GPU 显存不足以分配一个 KV Cache Block")
+    if requested_blocks == -1:
+        return available_blocks
+    if requested_blocks <= 0:
+        raise ValueError("num_kvcache_blocks 必须为 -1（自动）或正整数")
+    if requested_blocks > available_blocks:
+        raise ValueError(
+            f"请求 {requested_blocks} 个 KV Cache Blocks，但当前 GPU 最多只能安全分配 "
+            f"{available_blocks} 个"
+        )
+    return requested_blocks
+
+
 class ModelRunner:
 
     def __init__(self, config: Config, rank: int, event: Event | list[Event]):
@@ -121,8 +137,15 @@ class ModelRunner:
                        num_kv_heads *                   # 当前 GPU 负责多少个 KV heads, 张量并行时，这是切分后本地的 KV head 数
                        head_dim *                       # 每个 KV head 的维度数
                        self.dtype.itemsize)             # 每个数占多少字节
-        config.num_kvcache_blocks = int(total * config.gpu_memory_utilization - used - peak + current) // block_bytes
-        assert config.num_kvcache_blocks > 0
+        available_blocks = (
+            int(total * config.gpu_memory_utilization - used - peak + current)
+            // block_bytes
+        )
+        # -1 保持原来的自动容量；显式正整数用于复现实验中的固定 KV 压力。
+        config.num_kvcache_blocks = resolve_num_kvcache_blocks(
+            config.num_kvcache_blocks,
+            available_blocks,
+        )
                                 #  kv       每个 transformer layer      物理 blocks             block 存多少 token
         self.kv_cache = torch.empty(2, hf_config.num_hidden_layers, config.num_kvcache_blocks, self.block_size, num_kv_heads, head_dim)
         layer_id = 0

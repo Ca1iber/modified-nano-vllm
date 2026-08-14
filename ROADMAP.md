@@ -6,14 +6,16 @@
 ## 当前进度
 
 - 初始个人开发基线：`1655bdc`（2026-07-29 创建的无父节点 `Initial commit`）。
-- 最新完成检查点：P0.3 EngineStats 与请求时间线（本次提交）。
+- 最新完成检查点：P0.4 可复现 workload（本次提交）。
 - 已完成 P0.3a RequestMetrics、P0.3b StepMetrics、P0.3c
   preemption/recompute 与 KV Cache 指标，以及 P0.3d 百分位汇总和 benchmark
   报告接口。
 - 已完成当前单 GPU 环境可验收的 P0.2 正确性测试：Eager/CUDA Graph、
   Prefix Cache 命中/不命中对照和跨 Block KV slot 正确性。P0.2d TP=1/TP=2
   对照因长期只有单 GPU 标记为受阻的分布式扩展项，不纳入本轮验收。
-- 下一项：P0.4 可复现 workload。
+- P0.4 可复现 workload 已完成：六场景 GPU pytest 全部通过；修复预热 seed 的
+  Prefix Cache 污染后，独立进程 suite 已完成一次预热、三轮正式测试并生成
+  valid Markdown/JSON 基线。本次提交保存 P0.4 检查点，下一步进入 P1 Scheduler。
 - 顺序调整：按 2026-08-01 的决定先完成 P0.3，P0.2 GPU 正确性测试仍保留在计划中。
 - 当前定位：约 1200 行的离线推理教学实现，不以完整复刻生产 vLLM 为目标。
 
@@ -252,7 +254,7 @@ P0.3d 完成证据：
   非法重复次数，以及 workload 的跨进程可复现和逐轮变化；完整 CPU 回归结果为
   `44 passed`，`python -m py_compile` 与 `git diff --check` 均通过。
 
-### `[ ]` P0.4 可复现 workload
+### `[x]` P0.4 可复现 workload
 
 至少建立：
 
@@ -264,6 +266,145 @@ P0.3d 完成证据：
 - 已有 Decode 中途到达长 Prefill。
 
 固定随机种子、warmup、重复次数和模型配置。
+
+实施拆分：
+
+- `[x]` P0.4a：统一 `RequestSpec`/`WorkloadSpec` 和三个静态长度场景。
+- `[x]` P0.4b：共享前缀 Primer/Target 两阶段高命中场景。
+- `[x]` P0.4c：显式 KV Block 容量限制和稳定抢占场景。
+- `[x]` P0.4d：已有 Decode 请求运行中途加入长 Prefill 场景。
+- `[x]` P0.4e：六场景固定 warmup/repeat 验收与完整基线记录。
+
+P0.4a 完成证据：
+
+- 日期：2026-08-13。
+- 数据结构：`bench_workloads.py` 用 `RequestSpec` 固定 Prompt token、输出长度、
+  请求分组和到达 Step；`WorkloadSpec` 固定请求集合、模型长度、token budget
+  和最大并发 Sequence 数。
+- 兼容性：`python bench.py` 仍默认使用原 `random_mixed`；新增
+  `--workload` 可选 `short_prompt_long_decode`、`long_prompt_short_decode`
+  和 `mixed_lengths`。相同 seed 重现完全相同的 token，更换 seed 只改变
+  token 内容，不改变请求长度、分组和顺序。
+- CPU 测试：`tests/test_bench.py` 共 14 项，覆盖 CLI、参数边界、四个 workload
+  名称、三个静态场景形状、长短请求交错顺序、seed 可复现性和配置摘要。
+- 完整默认回归：`bash tests/run.sh all -q` 结果为 `53 passed, 5 skipped`。
+- GPU 环境：RTX 3060 12 GiB、Qwen3-0.6B、CUDA Graph、`enable_stats=True`、
+  `seed=0`、每个新场景各运行 1 轮。
+- 短 Prompt 长 Decode：16 条 `32 -> 256` 请求全部完成；1 Prefill + 255 Decode
+  Step，4096 输出 token，3.56 s，1149.74 tok/s，ITL P50/P95/P99
+  为 8.35/10.68/11.88 ms。
+- 长 Prompt 短 Decode：8 条 `1024 -> 16` 请求全部完成；1 Prefill + 15 Decode
+  Step，128 输出 token，0.76 s，169.48 tok/s，TTFT P50/P95/P99
+  为 582.43/582.53/582.54 ms。
+- 长短混合：8 条 `32 -> 256` 与 8 条 `1024 -> 16` 交错入队；4096-token
+  budget 使 16 条请求形成 3 Prefill + 255 Decode Step，2176 输出 token，
+  2.70 s，807.34 tok/s，ITL P99 为 14.09 ms、Max 为 330.40 ms。
+
+P0.4b 完成证据：
+
+- 固定 1 条 Primer 和 16 条 Target；所有 Prompt 均为 512-token 公共前缀加
+  32-token 独立尾部，Primer 生成 1 token，Target 各生成 32 token。
+- benchmark 先单独完成 Primer，再同步 GPU 并开始正式 Target 计时；第二次
+  `generate()` 重置 EngineStats，因此正式报告只包含 16 条 Target 和 512 个
+  输出 token，不把建立缓存的 Primer 成本混入高命中阶段。
+- CPU 测试覆盖共享结构、尾部唯一性、seed 可复现、Primer/Target 两阶段调用、
+  正式统计边界与配置摘要；`tests/test_bench.py` 结果为 `19 passed`。
+- GPU 正确性验收：Qwen3-0.6B、单 GPU、Eager，专项测试
+  `test_shared_prefix_workload_hits_expected_gpu_cache_blocks` 通过；第二批指标为
+  16/16 请求完成、512 个正式输出 token、`Prefix hit blocks=32`、
+  `Prefix hit tokens=8192`，证明每条 Target 均真实复用两个 256-token KV Block。
+- GPU benchmark：`seed=0`、统计开启、1 轮，32 Step（1 Prefill + 31 Decode），
+  正式阶段 0.71 s、723.39 tok/s，TTFT P50/P95/P99 均约 351.00 ms，
+  ITL P50/P95/P99 为 11.74/12.83/13.23 ms，Peak used KV blocks=18。
+- Prefix Cache A/B：新增 `bench_prefix_cache.py`，用两个独立引擎对相同 seed 的
+  16 条 Target 分别运行 Miss（不执行 Primer）和 Hit（Primer 不计时），避免两组
+  缓存互相污染。命令为 `python bench_prefix_cache.py --repeat 3 --seed 0
+  --model ~/huggingface/Qwen3-0.6B`；三轮中位数结果为 Miss 0.856 s、598.38 tok/s、
+  TTFT P50/P99 495.31/495.44 ms，Hit 0.398 s、1287.10 tok/s、TTFT P50/P99
+  44.02/44.03 ms，正式阶段加速 `2.15x`。Miss 实算 8704 个 Prefill token、命中 0，
+  Hit 实算 512 个、命中 8192 个，Prefill 计算量减少 94.12%。性能只作 benchmark
+  报告，不把易受 GPU 波动影响的“Hit 必须更快”写成正确性硬断言。
+
+P0.4c 完成证据：
+
+- `num_kvcache_blocks=-1` 保持按当前 GPU 安全容量自动计算；显式正整数不再被
+  `ModelRunner.allocate_kv_cache()` 覆盖。0、除 -1 外的负数、超过安全容量以及
+  连一个 Block 都无法分配的情况会在创建 KV Tensor 前给出明确错误。
+- 新增 `kv_pressure_preemption`：两条互不相同的 256-token Prompt，各生成
+  16 token，token budget=512、max_seqs=2，并显式限制 2 个 256-token KV Blocks。
+  首轮 Prefill 后两块占满，Decode 跨块时稳定抢占队尾请求；恢复后重算其 KV。
+- CPU 测试：`tests/test_kv_capacity.py` 共 7 项，覆盖自动/显式容量和非法边界；
+  `tests/test_bench.py` 增加 KV 紧张试卷结构和 seed 可复现测试。
+- GPU 正确性：Qwen3-0.6B、单 GPU、确定性 argmax；4-Block 宽松组无抢占，
+  2-Block 紧张组恰好发生 1 次抢占、释放 1 个物理 Block、重算 256 token。
+  两组最终 token ID 完全一致、2/2 请求完成，结束后 used=0 且所有 Block 回到 free。
+- GPU benchmark：`python bench.py --workload kv_pressure_preemption --enable-stats
+  --repeat 1 --seed 0`；正式阶段 0.55 s、58.51 tok/s，31 Step（2 Prefill +
+  29 Decode），Preemptions=1、Preempted cached tokens=256、Freed physical
+  blocks=1、Recompute steps=1、Recomputed tokens=256、Peak used KV blocks=2。
+
+P0.4d 完成证据：
+
+- 新增 `decode_then_long_prefill`：四条 `32 -> 64` 请求在 Step 0 到达，完成一次
+  Prefill 和八轮 Decode 后，一条 `1024 -> 16` 请求在 Step 9 前加入；512-token
+  budget 使迟到 Prompt 固定执行两轮 Chunked Prefill。9 个显式 KV Blocks 足够
+  容纳全部请求，用于排除抢占和重计算干扰。
+- `bench.py` 对含非零 `arrival_step` 的 workload 改用 `add_request() + step()` 驱动；
+  `add_request()` 返回 `seq_id`，动态循环保持 RequestSpec 到 RequestMetrics 的映射，
+  并在引擎空闲时显式重置上一轮统计。普通 workload 仍沿用 `generate()`。
+- benchmark 摘要额外报告 arrival 分布、旧请求正常 Decode ITL、跨越迟到 Prefill
+  的中断 ITL，以及迟到请求 TTFT；关闭 stats 时仍可只测吞吐。
+- CPU 测试覆盖试卷结构、seed 可复现、准确 Step 9 入队、输出排序、指标分组、
+  stats 关闭和安全 reset；完整回归结果为 `79 passed, 8 skipped`。
+- GPU benchmark：RTX 3060、Qwen3-0.6B、CUDA Graph、stats 开启、seed=0～2、
+  repeat=3；五条请求均完成，每轮输出 272 token。三轮吞吐为
+  311.10/485.01/502.48 tok/s，中位数 485.01 tok/s；最后一轮共 66 Step
+  （3 Prefill + 63 Decode），正常 Decode ITL P50=6.56 ms，跨越迟到 Prefill
+  的中断 ITL P50/Max=82.11/82.11 ms，放大约 12.5 倍；迟到 Prompt TTFT
+  P50=75.12 ms。Preemptions=0、Recomputed tokens=0、Peak used KV blocks=9，
+  证明尾延迟尖峰来自两轮长 Prefill，而非 KV 抢占或重计算。
+- 统一 GPU pytest 已通过：`tests/test_workloads_gpu.py` 六个参数全部通过，总耗时
+  93.64 s；动态场景检查了 `Prefill -> 8 Decode -> 2 Prefill -> Decode` 的真实
+  StepMetrics、到达前每条旧请求已有 9 个输出 token、五条请求输出长度、零抢占/
+  重计算和最终 9 个 KV Blocks 全释放。结合上述 benchmark，P0.4d 验收完成。
+
+P0.4e 完成证据：
+
+- `OFFICIAL_WORKLOAD_NAMES` 固定 P0.4 六张正式试卷，兼容旧入口的 `random_mixed`
+  不进入统一验收，避免把历史随机场景误算成第七张正式试卷。
+- 新增 `tests/test_workloads_gpu.py` 参数化 GPU pytest；六场景分别在干净子进程
+  自动检查请求完成数、输出长度、Prefill/Decode Step、Prefix 命中、抢占/重算
+  和最终 KV Block 释放。耗时和吞吐不作为正确性硬断言。
+- 新增 `bench_suite.py`：每个 workload 使用独立引擎和 CUDA Graph，默认先执行
+  1 轮同形状预热，再用 seed=0/1/2 正式执行 3 轮；逐轮保存吞吐、TTFT、ITL、
+  E2E、Step 延迟和缓存事件，最终对每项指标取中位数，不选择最好一轮。
+- suite 默认将环境、commit、六场景中位数和每轮原始数据写入
+  `benchmarks/P0_4_BASELINE.md`，并把完整结构化指标写入同名 `.json`；最终报告
+  标记 `valid=true`，保存环境、配置、六场景中位数和 18 轮原始数据。
+- CPU 验证：`tests/test_bench_suite.py` 8 项覆盖参数边界、独立 worker 命令、
+  预热 seed 隔离、多指标中位数、结果完整性、缓存污染拒绝、Markdown 报告和 JSON
+  环境序列化；完整 CPU 回归为 `87 passed, 14 skipped`，其中 14 项均为默认关闭
+  或当前工具环境不可用的 GPU 测试。
+- GPU 正确性：2026-08-14 在 RTX 3060/Qwen3-0.6B 上运行统一参数化测试，六张
+  正式试卷全部通过（`6 passed in 93.64s`）；随后完成的正式 suite 数据记录如下。
+- 首次完整 suite 成功运行六场景，但原始 JSON 暴露出基线污染：预热使用 seed=-1，
+  而 Python `Random(-1)` 与 `Random(1)` 生成相同 Prompt，导致
+  `long_prompt_short_decode` 和 `mixed_lengths` 的正式 seed=1 均异常命中
+  6144 个 Prefix token，TTFT 也显著低于另外两轮，因此该次报告标记为 invalid。
+- 修复：预热改用与正式区间隔离的正整数 seed 域；`--seed` 禁止负数；suite 验证
+  除 `shared_prefix_high_hit` 外的正式场景必须为零 Prefix 命中，否则直接拒绝生成
+  基线。
+- 正式 GPU 基线：2026-08-14，RTX 3060、Qwen3-0.6B、CUDA Graph、stats 开启、
+  warmup=1、repeat=3、base_seed=0。六场景吞吐中位数依次为 1966.55、164.11、
+  953.62、1311.69、133.66 和 520.66 tok/s；TTFT P99 依次为 35.86、620.82、
+  459.23、41.12、37.53 和 70.89 ms；ITL P99 依次为 10.43、13.45、12.08、
+  13.12、88.64 和 79.34 ms。
+- 18 个正式轮次全部完成且 Step 结构一致；普通场景 Prefix 命中均为 0，共享前缀
+  场景每轮命中 8192 token；KV 压力场景每轮恰好抢占 1 次并重算 256 token。
+  动态到达场景正常 Decode ITL P50=6.45 ms，跨越迟到 Prefill 的 ITL
+  P50/Max=79.34/79.34 ms，约放大 12.3 倍，为后续 P1 调度策略提供固定对照基线。
+- 正式报告：`benchmarks/P0_4_BASELINE.md`；逐轮原始指标：
+  `benchmarks/P0_4_BASELINE.json`。P0.4/P0.4e 验收完成。
 
 ## P1：Scheduler
 

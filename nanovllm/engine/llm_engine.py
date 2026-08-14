@@ -51,11 +51,17 @@ class LLMEngine:
             p.join()
 
     # 把 prompt 包装成 Sequence
-    def add_request(self, prompt: str | list[int], sampling_params: SamplingParams):
+    def add_request(
+        self,
+        prompt: str | list[int],
+        sampling_params: SamplingParams,
+    ) -> int:
+        """把请求加入 waiting，并返回 benchmark/在线调用可追踪的 seq_id。"""
         if isinstance(prompt, str):
             prompt = self.tokenizer.encode(prompt)
         seq = Sequence(prompt, sampling_params)
         self.scheduler.add(seq)
+        return seq.seq_id
 
     # 完成一个调度、模型执行和状态更新
     def step(self):
@@ -116,6 +122,13 @@ class LLMEngine:
             return None
         return self.stats.summarize()
 
+    def reset_metrics(self) -> None:
+        """在引擎空闲时清空上一批指标，供手动 add_request/step 循环划分批次。"""
+        if not self.scheduler.is_finished():
+            raise RuntimeError("只能在引擎没有 waiting/running 请求时重置指标")
+        if self.stats is not None:
+            self.stats.reset()
+
     # 驱动整个生成循环并整理结果
     def generate(
         self,
@@ -126,8 +139,8 @@ class LLMEngine:
         pbar = tqdm(total=len(prompts), desc="Generating", dynamic_ncols=True, disable=not use_tqdm)
         # 常规 generate 在空闲引擎上开始一批新请求，此时清掉上一批的统计数据。
         # 若调用者已经手动 add_request，则保留那些已登记但尚未完成的请求。
-        if self.stats is not None and self.scheduler.is_finished():
-            self.stats.reset()
+        if self.scheduler.is_finished():
+            self.reset_metrics()
         if not isinstance(sampling_params, list):
             sampling_params = [sampling_params] * len(prompts)
         for prompt, sp in zip(prompts, sampling_params):
