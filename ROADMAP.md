@@ -6,7 +6,8 @@
 ## 当前进度
 
 - 初始个人开发基线：`1655bdc`（2026-07-29 创建的无父节点 `Initial commit`）。
-- 最新完成检查点：P0.4 可复现 workload（本次提交）。
+- 最新已提交检查点：P0.4 可复现 workload（`92f1b6d`）。当前工作区正在完成
+  P1.1 Scheduler 策略接口及其 benchmark，相关修改尚未形成新的 checkpoint commit。
 - 已完成 P0.3a RequestMetrics、P0.3b StepMetrics、P0.3c
   preemption/recompute 与 KV Cache 指标，以及 P0.3d 百分位汇总和 benchmark
   报告接口。
@@ -18,6 +19,68 @@
   valid Markdown/JSON 基线。本次提交保存 P0.4 检查点，下一步进入 P1 Scheduler。
 - 顺序调整：按 2026-08-01 的决定先完成 P0.3，P0.2 GPU 正确性测试仍保留在计划中。
 - 当前定位：约 1200 行的离线推理教学实现，不以完整复刻生产 vLLM 为目标。
+
+## 当前聚焦路线
+
+当前只围绕三个相互关联的方向推进：
+
+```text
+Scheduler
+   ↓ 决定每轮 batch、Prefill/Decode 顺序和 token budget
+KV Cache
+   ↓ 决定 block 分配、slot 映射、复用、抢占和重算
+PagedAttention
+   ↓ 决定如何高效读取 block 化 KV Cache
+```
+
+### 主线 A：Scheduler
+
+目标：在不破坏请求状态和 KV block 生命周期的前提下，控制 TTFT、ITL、吞吐和
+Prefill/Decode 饥饿。
+
+当前顺序：
+
+1. 完成并提交 P1.1 `prefill_first`、`decode_first`、`time_sliced` 的实验 checkpoint。
+2. 增加公平 Chunked Prefill，验证长请求不会长期占用 token budget。
+3. 处理 Head-of-line blocking 和可配置抢占策略。
+4. 只有在上述指标稳定后，才考虑真正混合 Prefill/Decode。
+
+### 主线 B：KV Cache
+
+目标：证明逻辑 token、logical block、physical block、slot 和 GPU K/V 写入之间的
+不变量，并减少无谓的重算和缓存浪费。
+
+当前顺序：
+
+1. 完善 block 使用、Prefix Cache 命中、内部碎片、抢占和重算指标。
+2. 覆盖跨 block、Prefix Cache、抢占恢复和请求完成释放的测试。
+3. 在正确性稳定后，比较 block size、缓存淘汰和抢占策略。
+4. 暂不实现 Copy-on-Write、CPU offload 等更远的能力，除非有明确 workload 证明其必要性。
+
+### 主线 C：PagedAttention
+
+目标：实现一个可切换的 Paged Decode Attention backend，并验证独立 kernel 收益能否
+传递到 nano-vLLM 的 ITL 和吞吐。
+
+当前顺序：
+
+1. 先测量 `prepare_decode`、KV metadata 和现有 decode Attention 的耗时占比。
+2. 实现 CPU/PyTorch reference，固定 `block_table`、`context_lens` 和 GQA 语义。
+3. 实现最小 Triton/CUDA Paged Decode Attention：FP16/BF16、单 token decode、GQA、
+   跨 block。
+4. 接入 Attention backend 开关，比较 kernel microbenchmark 与 engine 端到端指标。
+5. 再考虑更小 block、量化 KV 或 TileLang/MXMACA 版本。
+
+### 当前阶段的转向条件
+
+- Scheduler 优化至少报告 TTFT、P50/P95/P99 ITL、吞吐和 starvation。
+- KV Cache 改动必须有 slot、ref_count、Prefix Cache 和资源释放测试。
+- PagedAttention 在实现前必须有 profile 证据；不能只因为 kernel 可写就直接进入优化。
+- 每次只推进一个可测假设；如果独立 kernel 变快但端到端没有收益，应记录并停止该方向。
+
+以下方向暂不作为当前开发任务：在线 Streaming、取消与背压、复杂 Sampling、分布式
+Sampling、Model Registry、第二模型、量化、多模态和完整混合 Prefill/Decode。它们保留
+在后面的 backlog 中，等三条主线形成闭环后再重新排序。
 
 ## 状态说明
 
@@ -408,7 +471,7 @@ P0.4e 完成证据：
 
 ## P1：Scheduler
 
-### `[ ]` P1.1 策略接口
+### `[x]` P1.1 策略接口
 
 实现配置化策略：
 
@@ -420,6 +483,20 @@ P0.4e 完成证据：
 
 - 相同请求最终结果和资源释放一致。
 - 比较 TTFT、P99 ITL、吞吐和 starvation。
+
+完成证据（2026-08-17）：
+
+- 已完成配置入口和 Scheduler 阶段拆分；默认 `prefill_first` 保持兼容，并支持
+  `decode_first` 与可配置配额的 `time_sliced`。
+- 参数化 CPU 测试验证三种策略最终输出、FINISHED 状态、队列清空、KV Block 释放和
+  `ref_count=0`；完整测试结果为 92 passed、14 skipped。
+- `decode_then_long_prefill` GPU 对比中，`prefill_first`、`decode_first`、
+  `time_sliced=4` 的吞吐中位数分别为 541.95、464.40、540.03 tok/s；迟到 Prompt
+  TTFT 分别为 71.19、409.84、94.76 ms；被长 Prefill 打断的 Decode ITL 分别为
+  78.26、6.82、40.48 ms。
+- starvation 结论：两个严格优先策略均存在另一阶段的饥饿风险；`time_sliced` 提供
+  阶段间有界调度机会。完整实验与口径见
+  `benchmarks/P1_1_SCHEDULER_POLICIES.md`。
 
 ### `[ ]` P1.2 公平 Chunked Prefill
 
@@ -463,7 +540,12 @@ P0.4e 完成证据：
 - 不以顺序执行两个独立 forward 冒充混合 batch。
 - 与分离执行比较吞吐、TTFT 和 ITL。
 
-## P2：在线 Continuous Batching
+## 后续 backlog（当前暂缓）
+
+下面的条目仍然保留设计草案和验收要求，但在 Scheduler、KV Cache、PagedAttention
+三条主线完成前不安排为当前迭代任务。
+
+### P2：在线 Continuous Batching
 
 ### `[ ]` P2.1 动态请求
 
@@ -489,7 +571,7 @@ P0.4e 完成证据：
 - 队列容量和拒绝语义。
 - 超出 KV/模型上限时返回明确错误。
 
-## P3：Sampling 与 logits
+### P3：Sampling 与 logits
 
 ### `[ ]` P3.1 基础 Sampling
 
@@ -517,7 +599,7 @@ P0.4e 完成证据：
 - 与完整 gather 结果严格一致。
 - 报告通信字节、collective 时间和端到端收益。
 
-## P4：KV Cache 与 Prefix Cache
+### P4：KV Cache 与 Prefix Cache
 
 ### `[ ]` P4.1 缓存可观测性
 
@@ -558,7 +640,7 @@ P0.4e 完成证据：
 - 验证 slot/block table 正确性。
 - 同时比较 kernel latency、内部碎片和端到端吞吐。
 
-## P5：Runtime 与 CUDA Graph
+### P5：Runtime 与 CUDA Graph
 
 ### `[ ]` P5.1 Metadata buffer 复用
 
@@ -581,7 +663,7 @@ P0.4e 完成证据：
 - 减少每步 pickle 数据量。
 - 研究调度、H2D 和 GPU 执行重叠。
 
-## P6：模型和后端扩展
+### P6：模型和后端扩展
 
 ### `[ ]` P6.1 Model Registry
 
@@ -602,17 +684,24 @@ P0.4e 完成证据：
 
 ## 推荐项目组合
 
-### 框架主线
+### 当前项目主线
 
-`P0 可观测性 -> P1 调度策略 -> P2 在线 Continuous Batching`
+`P0 可观测性 -> P1 Scheduler -> KV Cache -> PagedAttention`
 
-目标成果：动态请求、Streaming、取消、调度策略、完整 TTFT/ITL/吞吐评估。
+目标成果：Scheduler 策略、KV block 生命周期、PagedAttention backend，以及完整的
+kernel 与 engine 端到端性能证据。
+
+### 暂缓的框架扩展
+
+`在线请求 -> Streaming/取消 -> Sampling -> 分布式通信`
+
+这些方向等当前三条主线稳定后再重新排序。
 
 ### 算子与框架结合
 
-`P0 KV 指标 -> P4.5 自定义 Paged Attention -> P5 Runtime 优化`
+`KV Cache 不变量 -> Paged Decode Attention -> Attention backend -> engine benchmark`
 
-目标成果：自定义 backend、可配置小 block、正确性与端到端性能分析。
+目标成果：自定义 backend、可配置 block、正确性与端到端性能分析。
 
 ### 分布式主线
 

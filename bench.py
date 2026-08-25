@@ -12,6 +12,7 @@ from bench_workloads import (
     WorkloadSpec,
     build_workload_spec,
 )
+from nanovllm.config import SCHEDULER_POLICIES
 
 DEFAULT_MODEL_PATH = "~/huggingface/Qwen3-0.6B/"
 NUM_SEQS = 32
@@ -108,6 +109,18 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help=(
             "选择可复现工作负载；默认 random_mixed 保持原 benchmark 的请求分布。"
         ),
+    )
+    parser.add_argument(
+        "--scheduler-policy",
+        choices=SCHEDULER_POLICIES,
+        default="prefill_first",
+        help="调度顺序：prefill_first、decode_first 或 time_sliced（默认：prefill_first）。",
+    )
+    parser.add_argument(
+        "--time-sliced-decode-steps",
+        type=positive_int,
+        default=4,
+        help="time_sliced 连续 Decode 的 Step 配额（默认：4）。",
     )
     return parser.parse_args(argv)
 
@@ -353,6 +366,8 @@ def main(argv: list[str] | None = None) -> None:
         max_num_seqs=base_workload.max_num_seqs,
         num_kvcache_blocks=base_workload.num_kvcache_blocks,
         enable_stats=args.enable_stats,
+        scheduler_policy=args.scheduler_policy,
+        time_sliced_decode_steps=args.time_sliced_decode_steps,
     )
 
     # 预热不计入正式结果，避免首次 CUDA Graph 捕获和初始化成本污染吞吐。
@@ -361,7 +376,8 @@ def main(argv: list[str] | None = None) -> None:
 
     stats_state = "enabled" if args.enable_stats else "disabled"
     print(
-        f"Benchmark: workload={args.workload}, stats={stats_state}, repeats={args.repeat}, "
+        f"Benchmark: workload={args.workload}, scheduler_policy={args.scheduler_policy}, "
+        f"stats={stats_state}, repeats={args.repeat}, "
         f"base_seed={args.seed}"
     )
     print(format_workload(base_workload))

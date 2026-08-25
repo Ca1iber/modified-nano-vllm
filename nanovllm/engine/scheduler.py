@@ -1,6 +1,6 @@
 from collections import deque
 
-from nanovllm.config import Config
+from nanovllm.config import Config, SCHEDULER_POLICIES
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.stats import EngineStats
@@ -14,6 +14,14 @@ class Scheduler:
         self.eos = config.eos
         self.block_size = config.kvcache_block_size
         self.block_manager = BlockManager(config.num_kvcache_blocks, config.kvcache_block_size)
+        self.scheduler_policy = getattr(config, "scheduler_policy", "prefill_first")
+        self.time_sliced_decode_steps = getattr(config, "time_sliced_decode_steps", 4)
+        if self.scheduler_policy not in SCHEDULER_POLICIES:
+            raise ValueError(f"scheduler_policy 必须是 {SCHEDULER_POLICIES} 之一")
+        if self.time_sliced_decode_steps <= 0:
+            raise ValueError("time_sliced_decode_steps 必须为正整数")
+        # time_sliced 用它记录上一次 Prefill 后已经连续执行了多少个 Decode Step。
+        self.decode_steps_since_prefill = 0
         # stats=None 时所有调度和状态转换都沿用原来的路径，不产生计时开销。
         self.stats = stats
         # 创建一个装 Sequence 类型的双端队列，可高效从左右两端添加和删除
@@ -30,7 +38,40 @@ class Scheduler:
             self.stats.record_arrival(seq.seq_id)
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        # scheduled_seqs = 当前step具体让谁上GPU
+        # 根据策略选择本 Step 先尝试 Prefill 还是 Decode。
+        for is_prefill, phase in self._phase_order():
+            scheduled_seqs = phase()
+            if scheduled_seqs:
+                self._record_scheduled(scheduled_seqs)
+                if is_prefill:
+                    self.decode_steps_since_prefill = 0
+                else:
+                    self.decode_steps_since_prefill += 1
+                return scheduled_seqs, is_prefill
+        raise RuntimeError("Scheduler 没有可调度的请求")
+
+    def _phase_order(self):
+        """返回本轮的候选阶段；阶段函数只负责尝试调度，不负责计时或计数。"""
+        if self.scheduler_policy == "prefill_first":
+            return ((True, self._schedule_prefill), (False, self._schedule_decode))
+        if self.scheduler_policy == "decode_first":
+            return ((False, self._schedule_decode), (True, self._schedule_prefill))
+        # time_sliced：达到 Decode 配额且确实有等待请求时，优先给等待请求一次机会。
+        if (
+            self.waiting
+            and self.running
+            and self.decode_steps_since_prefill >= self.time_sliced_decode_steps
+        ):
+            return ((True, self._schedule_prefill), (False, self._schedule_decode))
+        return ((False, self._schedule_decode), (True, self._schedule_prefill))
+
+    def _record_scheduled(self, scheduled_seqs: list[Sequence]):
+        """把真正进入本 Step 的请求登记到统计对象；关闭统计时不做任何操作。"""
+        if self.stats is not None:
+            self.stats.record_scheduled([seq.seq_id for seq in scheduled_seqs])
+
+    def _schedule_prefill(self) -> list[Sequence]:
+        # scheduled_seqs = 当前 Prefill Step 具体让谁上 GPU
         scheduled_seqs = []
         num_batched_tokens = 0
 
@@ -75,12 +116,13 @@ class Scheduler:
             scheduled_seqs.append(seq)
 
         if scheduled_seqs:
-            if self.stats is not None:
-                # 以 scheduled_seqs 为准；未完成的 Chunked Prefill 也算真正被调度。
-                self.stats.record_scheduled([seq.seq_id for seq in scheduled_seqs])
-            return scheduled_seqs, True
+            return scheduled_seqs
 
-        # decode
+        return []
+
+    def _schedule_decode(self) -> list[Sequence]:
+        # Decode Step 中，每个被选中的 running 请求只计算一个 token。
+        scheduled_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             # 当前 Sequence 没有足够的 KV Cache 空间容纳这次 Decode token，因此需要先释放空间
@@ -96,11 +138,9 @@ class Scheduler:
                 # 如果新 token 正好跨入一个新逻辑 block，就分配一个新的物理 KV block
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
-        assert scheduled_seqs
-        self.running.extendleft(reversed(scheduled_seqs))
-        if self.stats is not None:
-            self.stats.record_scheduled([seq.seq_id for seq in scheduled_seqs])
-        return scheduled_seqs, False
+        if scheduled_seqs:
+            self.running.extendleft(reversed(scheduled_seqs))
+        return scheduled_seqs
 
     def preempt(self, seq: Sequence):
         if self.stats is not None:

@@ -18,6 +18,7 @@ from bench import (
     summarize_dynamic_arrival,
 )
 from bench_workloads import OFFICIAL_WORKLOAD_NAMES, build_workload_spec
+from nanovllm.config import SCHEDULER_POLICIES
 
 
 DEFAULT_MODEL_PATH = "~/huggingface/Qwen3-0.6B/"
@@ -52,6 +53,12 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser.add_argument("--repeat", type=positive_int, default=3)
     parser.add_argument("--seed", type=non_negative_int, default=0)
     parser.add_argument("--report", default=DEFAULT_REPORT_PATH)
+    parser.add_argument(
+        "--scheduler-policy",
+        choices=SCHEDULER_POLICIES,
+        default="prefill_first",
+    )
+    parser.add_argument("--time-sliced-decode-steps", type=positive_int, default=4)
     parser.add_argument(
         "--workload",
         choices=OFFICIAL_WORKLOAD_NAMES,
@@ -139,6 +146,8 @@ def run_worker(args: argparse.Namespace) -> dict:
         max_num_seqs=base_workload.max_num_seqs,
         num_kvcache_blocks=base_workload.num_kvcache_blocks,
         enable_stats=True,
+        scheduler_policy=args.scheduler_policy,
+        time_sliced_decode_steps=args.time_sliced_decode_steps,
     )
     atexit.unregister(llm.exit)
     runs = []
@@ -208,12 +217,16 @@ def run_worker(args: argparse.Namespace) -> dict:
         "warmup": args.warmup,
         "repeat": args.repeat,
         "base_seed": args.seed,
+        "scheduler_policy": args.scheduler_policy,
+        "time_sliced_decode_steps": args.time_sliced_decode_steps,
         "runs": runs,
     }
 
 
 def build_worker_command(script_path: Path, args, workload_name: str) -> list[str]:
     """构造只运行一个 workload 的独立子进程命令。"""
+    scheduler_policy = getattr(args, "scheduler_policy", "prefill_first")
+    time_sliced_decode_steps = getattr(args, "time_sliced_decode_steps", 4)
     return [
         sys.executable,
         str(script_path),
@@ -225,6 +238,10 @@ def build_worker_command(script_path: Path, args, workload_name: str) -> list[st
         str(args.repeat),
         "--seed",
         str(args.seed),
+        "--scheduler-policy",
+        scheduler_policy,
+        "--time-sliced-decode-steps",
+        str(time_sliced_decode_steps),
         "--worker-workload",
         workload_name,
     ]
@@ -331,6 +348,8 @@ def build_markdown_report(
     warmup: int,
     repeat: int,
     seed: int,
+    scheduler_policy: str = "prefill_first",
+    time_sliced_decode_steps: int = 4,
     environment: dict,
 ) -> str:
     """把配置、每轮原始数据和多轮中位数生成可提交的中文基线报告。"""
@@ -350,7 +369,8 @@ def build_markdown_report(
         f"- Python：{environment['python']}",
         f"- PyTorch：{environment['torch']}",
         f"- CUDA：{environment['cuda']}",
-        f"- 执行设置：CUDA Graph，stats 开启，warmup={warmup}，repeat={repeat}，base_seed={seed}",
+        f"- 执行设置：CUDA Graph，stats 开启，scheduler_policy={scheduler_policy}，"
+        f"time_sliced_decode_steps={time_sliced_decode_steps}，warmup={warmup}，repeat={repeat}，base_seed={seed}",
         "- 基线状态：valid（正式轮次已通过输出完整性与 Prefix Cache 隔离检查）",
         "",
         "## 六场景中位数",
@@ -450,7 +470,7 @@ def run_parent(args: argparse.Namespace) -> list[dict]:
     workloads = args.workloads or list(OFFICIAL_WORKLOAD_NAMES)
     results = []
     print(
-        f"P0.4 Benchmark Suite: workloads={len(workloads)}, warmup={args.warmup}, "
+        f"P0.4 Benchmark Suite: policy={args.scheduler_policy}, workloads={len(workloads)}, warmup={args.warmup}, "
         f"repeat={args.repeat}, base_seed={args.seed}"
     )
     for index, workload_name in enumerate(workloads, start=1):
@@ -478,6 +498,8 @@ def run_parent(args: argparse.Namespace) -> list[dict]:
             warmup=args.warmup,
             repeat=args.repeat,
             seed=args.seed,
+            scheduler_policy=args.scheduler_policy,
+            time_sliced_decode_steps=args.time_sliced_decode_steps,
             environment=environment,
         ),
         encoding="utf-8",
@@ -492,6 +514,8 @@ def run_parent(args: argparse.Namespace) -> list[dict]:
                 "warmup": args.warmup,
                 "repeat": args.repeat,
                 "base_seed": args.seed,
+                "scheduler_policy": args.scheduler_policy,
+                "time_sliced_decode_steps": args.time_sliced_decode_steps,
                 "results": results,
             },
             ensure_ascii=False,

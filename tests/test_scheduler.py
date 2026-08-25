@@ -341,6 +341,153 @@ def test_prefill_first_prioritizes_waiting_prompt_over_running_decode(
     assert list(scheduler.running) == [decode_seq]
 
 
+# 场景：已有请求正在 Decode 时，又加入一个新的 waiting 请求。
+# 验证 decode_first 会先继续调度 running 请求；只有 running 为空时，才回退到 Prefill。
+def test_decode_first_prioritizes_running_decode_over_waiting_prefill(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    config = SimpleNamespace(
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        eos=99,
+        kvcache_block_size=block_size,
+        num_kvcache_blocks=6,
+        scheduler_policy="decode_first",
+        time_sliced_decode_steps=4,
+    )
+    scheduler = Scheduler(config)
+    running_seq = Sequence([10, 11, 12, 13], SamplingParams(max_tokens=2))
+    waiting_seq = Sequence([20, 21, 22, 23], SamplingParams(max_tokens=2))
+    scheduler.add(running_seq)
+
+    prefill_seqs, is_prefill = scheduler.schedule()
+    assert is_prefill is True  # 冷启动没有 running，只能先完成 Prefill。
+    scheduler.postprocess(prefill_seqs, [90], is_prefill)
+    scheduler.add(waiting_seq)
+
+    decode_seqs, is_prefill = scheduler.schedule()
+    assert is_prefill is False
+    assert decode_seqs == [running_seq]
+    assert list(scheduler.waiting) == [waiting_seq]
+
+    # running 请求完成后，decode_first 仍能回退到 waiting 队列完成 Prefill。
+    scheduler.postprocess(decode_seqs, [91], is_prefill)
+    prefill_seqs, is_prefill = scheduler.schedule()
+    assert is_prefill is True
+    assert prefill_seqs == [waiting_seq]
+
+
+# 场景：time_sliced 配置为连续 2 个 Decode Step 后让等待请求获得一次机会。
+# 验证前两轮优先 Decode，达到配额后第三轮切换 Prefill，并在切换后清零计数器。
+def test_time_sliced_switches_to_waiting_prefill_after_decode_quota(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    config = SimpleNamespace(
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        eos=99,
+        kvcache_block_size=block_size,
+        num_kvcache_blocks=6,
+        scheduler_policy="time_sliced",
+        time_sliced_decode_steps=2,
+    )
+    scheduler = Scheduler(config)
+    running_seq = Sequence([10, 11, 12, 13], SamplingParams(max_tokens=8))
+    waiting_seq = Sequence([20, 21, 22, 23], SamplingParams(max_tokens=2))
+    scheduler.add(running_seq)
+    prefill_seqs, is_prefill = scheduler.schedule()
+    scheduler.postprocess(prefill_seqs, [90], is_prefill)
+    scheduler.add(waiting_seq)
+
+    first, is_prefill = scheduler.schedule()
+    assert first == [running_seq]
+    assert is_prefill is False
+    assert scheduler.decode_steps_since_prefill == 1
+    scheduler.postprocess(first, [91], is_prefill)
+
+    second, is_prefill = scheduler.schedule()
+    assert second == [running_seq]
+    assert is_prefill is False
+    assert scheduler.decode_steps_since_prefill == 2
+    scheduler.postprocess(second, [92], is_prefill)
+
+    third, is_prefill = scheduler.schedule()
+    assert third == [waiting_seq]
+    assert is_prefill is True
+    assert scheduler.decode_steps_since_prefill == 0
+
+
+# 场景：请求 A 已经进入 Decode 后，请求 B 才到达；分别使用三种调度策略把两条请求
+# 一直运行到结束。策略只应改变 A、B 获得 Step 的先后顺序，不能丢失或重复输出 token。
+# 验证两条请求最终都生成预期 token、进入 FINISHED，并从 waiting/running 中移除；同时
+# 检查 block_table、used_block_ids 和全部 ref_count，确保不同策略都完整释放 KV 资源。
+@pytest.mark.parametrize(
+    "scheduler_policy",
+    ["prefill_first", "decode_first", "time_sliced"],
+)
+def test_scheduler_policies_finish_same_outputs_and_release_all_kv_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+    scheduler_policy: str,
+):
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    config = SimpleNamespace(
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        eos=99,
+        kvcache_block_size=block_size,
+        num_kvcache_blocks=8,
+        scheduler_policy=scheduler_policy,
+        time_sliced_decode_steps=2,
+    )
+    scheduler = Scheduler(config)
+    seq_a = Sequence(
+        token_ids=[10, 11, 12, 13],
+        sampling_params=SamplingParams(max_tokens=4),
+    )
+    seq_b = Sequence(
+        token_ids=[20, 21, 22, 23],
+        sampling_params=SamplingParams(max_tokens=3),
+    )
+
+    # 先让 A 完成 Prefill，再加入 B，构造 running 与 waiting 同时非空的策略分歧点。
+    scheduler.add(seq_a)
+    scheduled_seqs, is_prefill = scheduler.schedule()
+    scheduler.postprocess(scheduled_seqs, token_ids=[100], is_prefill=is_prefill)
+    scheduler.add(seq_b)
+
+    # CPU 测试用固定 token 代替模型输出。token 只取决于 Sequence 和已完成数量，
+    # 因此即使三种策略的执行顺序不同，最终输出也应该完全一致。
+    num_steps = 0
+    while not scheduler.is_finished():
+        scheduled_seqs, is_prefill = scheduler.schedule()
+        token_ids = [
+            (100 if seq is seq_a else 200) + seq.num_completion_tokens
+            for seq in scheduled_seqs
+        ]
+        scheduler.postprocess(scheduled_seqs, token_ids, is_prefill)
+        num_steps += 1
+        assert num_steps < 20  # 防止策略错误导致测试永久循环。
+
+    assert seq_a.completion_token_ids == [100, 101, 102, 103]
+    assert seq_b.completion_token_ids == [200, 201, 202]
+    assert seq_a.status is SequenceStatus.FINISHED
+    assert seq_b.status is SequenceStatus.FINISHED
+    assert seq_a.num_cached_tokens == 0
+    assert seq_b.num_cached_tokens == 0
+    assert seq_a.block_table == []
+    assert seq_b.block_table == []
+    assert list(scheduler.waiting) == []
+    assert list(scheduler.running) == []
+    assert scheduler.block_manager.used_block_ids == set()
+    assert len(scheduler.block_manager.free_block_ids) == config.num_kvcache_blocks
+    assert all(block.ref_count == 0 for block in scheduler.block_manager.blocks)
+
+
 # 场景：一个请求完成 Prefill 后位于 running，并持有一个物理 KV Block；随后它被选为 victim。
 # 验证 preempt 将请求放回 waiting、清空其 KV 进度和 block_table，同时把物理 Block
 # 从 used 集合归还到 free 队列，并将引用计数降为零；已生成的逻辑 token 仍然保留。

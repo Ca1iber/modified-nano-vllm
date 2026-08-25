@@ -2,6 +2,8 @@ import os
 from dataclasses import dataclass
 from transformers import AutoConfig
 
+SCHEDULER_POLICIES = ("prefill_first", "decode_first", "time_sliced")
+
 
 @dataclass(slots=True)
 class Config:
@@ -18,6 +20,10 @@ class Config:
     eos: int = -1
     kvcache_block_size: int = 256
     num_kvcache_blocks: int = -1
+    # 调度策略：默认保持原有的 Prefill-first 行为。
+    scheduler_policy: str = "prefill_first"
+    # time_sliced 策略连续执行 Decode 的最多 Step 数。
+    time_sliced_decode_steps: int = 4
 
     def __post_init__(self):
         assert os.path.isdir(self.model)
@@ -25,5 +31,11 @@ class Config:
         assert 1 <= self.tensor_parallel_size <= 8
         if self.num_kvcache_blocks != -1 and self.num_kvcache_blocks <= 0:
             raise ValueError("num_kvcache_blocks 必须为 -1（自动）或正整数")
+        if self.scheduler_policy not in SCHEDULER_POLICIES:
+            raise ValueError(
+                f"scheduler_policy 必须是 {SCHEDULER_POLICIES} 之一"
+            )
+        if self.time_sliced_decode_steps <= 0:
+            raise ValueError("time_sliced_decode_steps 必须为正整数")
         self.hf_config = AutoConfig.from_pretrained(self.model)
         self.max_model_len = min(self.max_model_len, self.hf_config.max_position_embeddings)
