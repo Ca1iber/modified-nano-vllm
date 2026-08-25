@@ -6,8 +6,8 @@
 ## 当前进度
 
 - 初始个人开发基线：`1655bdc`（2026-07-29 创建的无父节点 `Initial commit`）。
-- 最新已提交检查点：P0.4 可复现 workload（`92f1b6d`）。当前工作区正在完成
-  P1.1 Scheduler 策略接口及其 benchmark，相关修改尚未形成新的 checkpoint commit。
+- 最新已提交检查点：P1.1 Scheduler 策略接口（`6a63727`）。当前实现仍保留
+  “一个 Step 只能是 Prefill 或 Decode”的教学简化，下一步演进为 vLLM 式统一 token 调度。
 - 已完成 P0.3a RequestMetrics、P0.3b StepMetrics、P0.3c
   preemption/recompute 与 KV Cache 指标，以及 P0.3d 百分位汇总和 benchmark
   报告接口。
@@ -40,10 +40,17 @@ Prefill/Decode 饥饿。
 
 当前顺序：
 
-1. 完成并提交 P1.1 `prefill_first`、`decode_first`、`time_sliced` 的实验 checkpoint。
-2. 增加公平 Chunked Prefill，验证长请求不会长期占用 token budget。
-3. 处理 Head-of-line blocking 和可配置抢占策略。
-4. 只有在上述指标稳定后，才考虑真正混合 Prefill/Decode。
+1. 保留 P1.1 `prefill_first`、`decode_first`、`time_sliced` 作为策略基线，不再继续在
+   全局 `is_prefill` 架构上堆叠策略分支。
+2. 实现统一 token-level Scheduler：每个请求独立产生 `num_scheduled_tokens`，全局只
+   受 token budget、KV Cache 容量和请求状态约束。
+3. 将混合 batch 所需的 `num_scheduled_tokens`、query 起止位置、slot mapping 和
+   block table 传给 ModelRunner/Attention。
+4. 在 metadata 语义稳定后，再实现真正的混合 Prefill/Decode 执行。
+
+公平性、队首阻塞和抢占不再作为孤立的架构目标，而是统一 token 调度下需要验证的
+行为风险：长请求不能永久占用 budget，暂时无法分配 KV block 的请求不能阻塞所有后续
+请求，显存不足时必须保证资源可回收和请求可恢复。
 
 ### 主线 B：KV Cache
 
@@ -54,8 +61,9 @@ Prefill/Decode 饥饿。
 
 1. 完善 block 使用、Prefix Cache 命中、内部碎片、抢占和重算指标。
 2. 覆盖跨 block、Prefix Cache、抢占恢复和请求完成释放的测试。
-3. 在正确性稳定后，比较 block size、缓存淘汰和抢占策略。
-4. 暂不实现 Copy-on-Write、CPU offload 等更远的能力，除非有明确 workload 证明其必要性。
+3. 让统一 token 调度能够按每个请求需要的 token 数量分配和申请 KV block。
+4. 在正确性稳定后，再比较 block size、缓存淘汰和抢占策略。
+5. 暂不实现 Copy-on-Write、CPU offload 等更远的能力，除非有明确 workload 证明其必要性。
 
 ### 主线 C：PagedAttention
 
@@ -65,9 +73,9 @@ Prefill/Decode 饥饿。
 当前顺序：
 
 1. 先测量 `prepare_decode`、KV metadata 和现有 decode Attention 的耗时占比。
-2. 实现 CPU/PyTorch reference，固定 `block_table`、`context_lens` 和 GQA 语义。
-3. 实现最小 Triton/CUDA Paged Decode Attention：FP16/BF16、单 token decode、GQA、
-   跨 block。
+2. 实现 CPU/PyTorch reference，固定 `block_table`、`context_lens`、query length
+   和 GQA 语义。
+3. 先支持混合 batch 中的 decode 行：FP16/BF16、单 token decode、GQA、跨 block。
 4. 接入 Attention backend 开关，比较 kernel microbenchmark 与 engine 端到端指标。
 5. 再考虑更小 block、量化 KV 或 TileLang/MXMACA 版本。
 
@@ -75,7 +83,9 @@ Prefill/Decode 饥饿。
 
 - Scheduler 优化至少报告 TTFT、P50/P95/P99 ITL、吞吐和 starvation。
 - KV Cache 改动必须有 slot、ref_count、Prefix Cache 和资源释放测试。
-- PagedAttention 在实现前必须有 profile 证据；不能只因为 kernel 可写就直接进入优化。
+- 统一 token 调度和混合 metadata 在实现前必须先定义；PagedAttention 在此基础上才有
+  真实的 batch/context workload。
+- PagedAttention 在优化前必须有 profile 证据；不能只因为 kernel 可写就直接进入优化。
 - 每次只推进一个可测假设；如果独立 kernel 变快但端到端没有收益，应记录并停止该方向。
 
 以下方向暂不作为当前开发任务：在线 Streaming、取消与背压、复杂 Sampling、分布式
@@ -498,47 +508,70 @@ P0.4e 完成证据：
   阶段间有界调度机会。完整实验与口径见
   `benchmarks/P1_1_SCHEDULER_POLICIES.md`。
 
-### `[ ]` P1.2 公平 Chunked Prefill
+### `[ ]` P1.2 统一 Token-level Scheduler
 
-目标：
+目标：去除 Scheduler 层的全局 `is_prefill` 阶段约束，改为对每个 Sequence 计算
+`num_scheduled_tokens`，由统一 token budget、请求状态和 KV Cache 容量决定本轮调度。
 
-- 不只允许队首 Sequence 获得 chunk。
-- 避免超长 Prompt 长期占据 token budget。
-- 记录每个请求的等待时间并支持 aging。
+参考 vLLM v0.27.1 的核心语义：Scheduler 不维护独立的 Prefill/Decode phase；请求通过
+`num_computed_tokens` 追赶 `num_tokens_with_spec`。nano-vLLM 只实现当前模型和单机实验
+需要的最小版本，不机械复制 vLLM 的异步、投机解码和多模态扩展。
 
 验收：
 
-- 无请求永久饥饿。
-- 每轮 scheduled token 不超过 budget。
+- 一个 Step 可以为不同 Sequence 分配不同数量的 token。
+- 所有请求的 `num_scheduled_tokens` 之和不超过 token budget。
+- 相同 workload 下，统一调度与 P1.1 baseline 的最终 token、状态和 KV 资源一致。
+- 报告 TTFT、P50/P95/P99 ITL、吞吐、队列等待和 KV block 事件。
+- 长 Chunked Prefill 不得永久占用 budget；暂时无法分配 KV block 的请求不能无条件阻塞
+  后续可调度请求。这些是验收风险，不单独形成调度架构。
 
-### `[ ]` P1.3 Head-of-line blocking
+### `[ ]` P1.3 混合 Batch Metadata
 
-当前队首请求无法分配时会阻止后续请求。实验性支持：
+目标：让 ModelRunner 和 Attention 接收每请求不同的 query length，而不是依赖全局
+`is_prefill` 在 `prepare_prefill` 与 `prepare_decode` 之间二选一。
 
-- 安全跳过暂时不可调度请求。
-- 保持公平性，避免大请求永久等待。
+需要统一表达：
 
-### `[ ]` P1.4 可配置抢占策略
+- `num_scheduled_tokens`：每个请求本轮计算的 token 数。
+- `query_start_loc` 或等价的 ragged batch 边界。
+- 每个请求的 `num_computed_tokens`、context length、block table 和 slot mapping。
+- 哪些 query 行仍处于 Prefill，哪些 query 行属于 Decode。
+
+验收：
+
+- 纯 Prefill 和纯 Decode 继续通过现有正确性测试。
+- 至少覆盖一个 Decode 请求与一个 Chunked Prefill 请求同一 Step 的 metadata 构造。
+- 跨 block slot、Prefix Cache 和请求完成后的 ref_count 均正确。
+- 不以两个独立的 Engine step 冒充一个混合 Scheduler step。
+
+### `[ ]` P1.4 混合 Prefill/Decode 执行
+
+目标：在 P1.3 metadata 稳定后，使同一 ModelRunner Step 能处理混合请求；Attention
+backend 可以先在同一 forward 中区分 decode 行和 prefill 行，再决定是否融合 kernel。
+
+验收：
+
+- 同一 Scheduler Step 同时包含 Decode 和 Chunked Prefill。
+- Decode 行和 Prefill 行分别使用正确的 causal、context length、KV block 和 slot 语义。
+- 与 P1.1 分阶段执行比较 TTFT、ITL、吞吐、GPU 空洞和 metadata 开销。
+- 明确区分“同一调度/forward step”和“同一个 Attention kernel launch”，不将两者混为一谈。
+
+### `[ ]` P1.5 KV-aware 调度与抢占
+
+目标：在统一 token 调度基础上比较 KV Cache 容量、待分配 block 数和重算成本对调度
+决策的影响。
 
 比较：
 
 - 当前 LIFO victim。
-- 最长剩余长度。
-- 最大 KV 占用。
-- 最低优先级/最晚到达。
-
-记录被释放 block、重计算 token 和受影响延迟。
-
-### `[ ]` P1.5 真正混合 Prefill/Decode
-
-这是高级项目。需要把全局 `is_prefill` 重构为可表达混合请求的 metadata，
-并处理两类 Attention 路径或引入统一 backend。
+- 最大 KV 占用或最大待分配 block 数。
+- 最长剩余 token 或最低优先级。
 
 验收：
 
-- 同一 Scheduler step 同时包含 Decode 和 Chunked Prefill。
-- 不以顺序执行两个独立 forward 冒充混合 batch。
-- 与分离执行比较吞吐、TTFT 和 ITL。
+- 记录释放 block、重算 token、受影响请求延迟和 Prefix Cache 命中变化。
+- 抢占、恢复、请求完成和异常路径最终释放全部请求拥有的资源。
 
 ## 后续 backlog（当前暂缓）
 
