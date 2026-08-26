@@ -6,8 +6,8 @@
 ## 当前进度
 
 - 初始个人开发基线：`1655bdc`（2026-07-29 创建的无父节点 `Initial commit`）。
-- 最新已提交检查点：P1.1 Scheduler 策略接口（`6a63727`）。当前实现仍保留
-  “一个 Step 只能是 Prefill 或 Decode”的教学简化，下一步演进为 vLLM 式统一 token 调度。
+- 最新已提交检查点：P1.2a SchedulerOutput 调度接口（`2970b37`）。当前实现仍保留
+  “一个 Step 只能是 Prefill 或 Decode”的教学简化，下一步进入 P1.2b 统一 token 调度。
 - 已完成 P0.3a RequestMetrics、P0.3b StepMetrics、P0.3c
   preemption/recompute 与 KV Cache 指标，以及 P0.3d 百分位汇总和 benchmark
   报告接口。
@@ -16,7 +16,7 @@
   对照因长期只有单 GPU 标记为受阻的分布式扩展项，不纳入本轮验收。
 - P0.4 可复现 workload 已完成：六场景 GPU pytest 全部通过；修复预热 seed 的
   Prefix Cache 污染后，独立进程 suite 已完成一次预热、三轮正式测试并生成
-  valid Markdown/JSON 基线。本次提交保存 P0.4 检查点，下一步进入 P1 Scheduler。
+  valid Markdown/JSON 基线；P1.1 Scheduler 策略和 P1.2a SchedulerOutput 接口已完成。
 - 顺序调整：按 2026-08-01 的决定先完成 P0.3，P0.2 GPU 正确性测试仍保留在计划中。
 - 当前定位：约 1200 行的离线推理教学实现，不以完整复刻生产 vLLM 为目标。
 
@@ -508,7 +508,7 @@ P0.4e 完成证据：
   阶段间有界调度机会。完整实验与口径见
   `benchmarks/P1_1_SCHEDULER_POLICIES.md`。
 
-### `[ ]` P1.2 统一 Token-level Scheduler
+### `[~]` P1.2 统一 Token-level Scheduler
 
 目标：去除 Scheduler 层的全局 `is_prefill` 阶段约束，改为对每个 Sequence 计算
 `num_scheduled_tokens`，由统一 token budget、请求状态和 KV Cache 容量决定本轮调度。
@@ -517,16 +517,21 @@ P0.4e 完成证据：
 `num_computed_tokens` 追赶 `num_tokens_with_spec`。nano-vLLM 只实现当前模型和单机实验
 需要的最小版本，不机械复制 vLLM 的异步、投机解码和多模态扩展。
 
-#### P1.2a SchedulerOutput 契约
+#### `[x]` P1.2a SchedulerOutput 契约
 
 先定义 Scheduler 与 Engine/ModelRunner 之间的新边界，不立即修改 Attention：
 
 ```python
-@dataclass
+@dataclass(slots=True)
 class SchedulerOutput:
-    seqs: list[Sequence]
-    num_scheduled_tokens: list[int]
+    scheduled_seqs: list[Sequence]
+    num_scheduled_tokens: dict[int, int]
     total_num_scheduled_tokens: int
+
+
+@dataclass(slots=True)
+class LegacySchedulerOutput(SchedulerOutput):
+    is_prefill: bool
 ```
 
 要求：
@@ -540,6 +545,17 @@ class SchedulerOutput:
 
 - CPU 测试覆盖空队列、单请求、Chunked Prefill、Decode 和 token budget 边界。
 - P1.1 的输出、状态和 KV block 测试全部保持通过。
+
+完成证据（2026-08-26）：
+
+- `Scheduler.schedule()` 已返回 `LegacySchedulerOutput`；`is_prefill` 作为兼容字段保留，
+  `scheduled_seqs`、每请求 `num_scheduled_tokens` 和总 token 数显式传递给 Engine。
+- `LLMEngine.step()`、Scheduler、Request Metrics、Cache Metrics 和 Step Metrics 测试已迁移到新对象接口。
+- Commit：`2970b37`（`重构：引入 SchedulerOutput 调度接口`）。
+- 验证：`conda run -n nano-vllm bash tests/run.sh all -q`，结果为 `92 passed, 14 skipped`；
+  `git diff --check` 通过。
+- 范围边界：本项没有删除全局 `is_prefill`，也没有实现混合 Prefill/Decode；这些属于
+  后续 P1.2b～P1.4。
 
 #### P1.2b 统一候选与 Token Budget 分配
 
