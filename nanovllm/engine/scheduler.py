@@ -4,7 +4,7 @@ from nanovllm.config import Config, SCHEDULER_POLICIES
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.stats import EngineStats
-from nanovllm.engine.scheduler_output import LegacySchedulerOutput
+from nanovllm.engine.scheduler_output import LegacySchedulerOutput, UnifiedSchedulerOutput
 
 class Scheduler:
 
@@ -28,6 +28,9 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
 
+        # 确认调度模式(getattr写法兼容旧测试)
+        self.scheduler_mode = getattr(config, 'scheduler_mode', 'legacy')
+
     def is_finished(self):
         return not self.waiting and not self.running
 
@@ -37,7 +40,18 @@ class Scheduler:
             # arrival 的口径是“成功进入 Scheduler.waiting”，不包含 tokenizer 时间。
             self.stats.record_arrival(seq.seq_id)
 
-    def schedule(self) -> LegacySchedulerOutput:
+    def schedule(self) -> LegacySchedulerOutput | UnifiedSchedulerOutput:
+        if self.scheduler_mode == "legacy":
+            return self._schedule_legacy()
+
+        if self.scheduler_mode == "unified":
+            return self._schedule_unified()
+
+        raise ValueError(
+            f"不支持的 scheduler_mode: {self.scheduler_mode}"
+        )
+
+    def _schedule_legacy(self) -> LegacySchedulerOutput:
         # 根据策略选择本 Step 先尝试 Prefill 还是 Decode。
         for is_prefill, phase in self._phase_order():
             scheduled_seqs = phase()
@@ -59,6 +73,11 @@ class Scheduler:
                     is_prefill=is_prefill,
                 )
         raise RuntimeError("Scheduler 没有可调度的请求")
+
+    def _schedule_unified(self) -> UnifiedSchedulerOutput:
+        raise NotImplementedError(
+            'Unified Scheduler 尚未实现'
+        )
 
     def _phase_order(self):
         """返回本轮的候选阶段；阶段函数只负责尝试调度，不负责计时或计数。"""

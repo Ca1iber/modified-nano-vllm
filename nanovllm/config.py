@@ -24,6 +24,8 @@ class Config:
     scheduler_policy: str = "prefill_first"
     # time_sliced 策略连续执行 Decode 的最多 Step 数。
     time_sliced_decode_steps: int = 4
+    # 选择新旧调度模式
+    scheduler_mode: str = "legacy"
 
     def __post_init__(self):
         assert os.path.isdir(self.model)

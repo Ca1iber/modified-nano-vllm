@@ -17,6 +17,44 @@ def schedule_legacy(scheduler: Scheduler):
     return output.scheduled_seqs, output.is_prefill
 
 
+def make_scheduler_config(**kwargs):
+    config = dict(
+        max_num_seqs=2,
+        max_num_batched_tokens=4,
+        eos=99,
+        kvcache_block_size=256,
+        num_kvcache_blocks=4,
+    )
+    config.update(kwargs)
+    return SimpleNamespace(**config)
+
+
+def test_scheduler_defaults_to_legacy_mode():
+    scheduler = Scheduler(make_scheduler_config())
+    seq = Sequence([10, 11], SamplingParams(max_tokens=1))
+    scheduler.add(seq)
+
+    output = scheduler.schedule()
+
+    assert scheduler.scheduler_mode == "legacy"
+    assert isinstance(output, LegacySchedulerOutput)
+    assert output.is_prefill is True
+
+
+def test_scheduler_rejects_unknown_mode():
+    scheduler = Scheduler(make_scheduler_config(scheduler_mode="unknown"))
+
+    with pytest.raises(ValueError, match="不支持的 scheduler_mode"):
+        scheduler.schedule()
+
+
+def test_unified_mode_is_explicitly_not_implemented():
+    scheduler = Scheduler(make_scheduler_config(scheduler_mode="unified"))
+
+    with pytest.raises(NotImplementedError, match="Unified Scheduler 尚未实现"):
+        scheduler.schedule()
+
+
 # 场景：6-token prompt 遇到 4-token budget，第一轮只能 Prefill 前 4 个 token。
 # 验证请求仍留在 waiting，postprocess 只推进 cached_tokens、不记录临时采样 token；
 # 同时检查 Scheduler 为完整 prompt 预留的两个 KV Block 及其引用计数。
