@@ -71,7 +71,8 @@ class LLMEngine:
         step_start_time = self.stats.clock() if self.stats is not None else None
         # 本轮选择哪些请求
         # 本轮被选中执行的 Sequence 列表，本轮是 prefill 还是 decode
-        seqs, is_prefill = self.scheduler.schedule()
+        scheduled_output = self.scheduler.schedule()
+        seqs, is_prefill = scheduled_output.scheduled_seqs, scheduled_output.is_prefill
         # StepMetrics 中 token 数始终使用正数；Prefill 累加本轮各请求的 chunk，
         # Decode 则是每个被调度请求各计算一个 token。
         num_step_tokens = (

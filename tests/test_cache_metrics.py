@@ -4,9 +4,19 @@ import pytest
 
 from nanovllm.engine.llm_engine import LLMEngine
 from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.scheduler_output import LegacySchedulerOutput
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.stats import EngineStats
 from nanovllm.sampling_params import SamplingParams
+
+
+def schedule_legacy(scheduler: Scheduler):
+    output = scheduler.schedule()
+    assert isinstance(output, LegacySchedulerOutput)
+    assert output.total_num_scheduled_tokens == sum(
+        output.num_scheduled_tokens.values()
+    )
+    return output.scheduled_seqs, output.is_prefill
 
 
 class FakeModelRunner:
@@ -63,7 +73,7 @@ def test_preemption_records_cached_tokens_references_and_freed_blocks(
     )
     scheduler.add(seq)
 
-    prefill_seqs, is_prefill = scheduler.schedule()
+    prefill_seqs, is_prefill = schedule_legacy(scheduler)
     scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
 
     assert seq.num_cached_tokens == 6
@@ -99,10 +109,10 @@ def test_preemption_does_not_count_shared_block_as_freed(
     )
 
     scheduler.add(seq1)
-    prefill_seqs, is_prefill = scheduler.schedule()
+    prefill_seqs, is_prefill = schedule_legacy(scheduler)
     scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
     scheduler.add(seq2)
-    prefill_seqs, is_prefill = scheduler.schedule()
+    prefill_seqs, is_prefill = schedule_legacy(scheduler)
     scheduler.postprocess(prefill_seqs, token_ids=[91], is_prefill=is_prefill)
 
     shared_block_id = seq1.block_table[0]
@@ -136,7 +146,7 @@ def test_recompute_counts_only_previously_computed_uncached_tokens(
         sampling_params=SamplingParams(max_tokens=3),
     )
     scheduler.add(seq)
-    prefill_seqs, is_prefill = scheduler.schedule()
+    prefill_seqs, is_prefill = schedule_legacy(scheduler)
     scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
 
     scheduler.running.remove(seq)
@@ -177,9 +187,9 @@ def test_chunked_prefill_is_not_recompute(monkeypatch: pytest.MonkeyPatch):
     )
     scheduler.add(seq)
 
-    first_seqs, is_prefill = scheduler.schedule()
+    first_seqs, is_prefill = schedule_legacy(scheduler)
     scheduler.postprocess(first_seqs, token_ids=[89], is_prefill=is_prefill)
-    second_seqs, is_prefill = scheduler.schedule()
+    second_seqs, is_prefill = schedule_legacy(scheduler)
     scheduler.postprocess(second_seqs, token_ids=[90], is_prefill=is_prefill)
 
     metrics = stats.requests[seq.seq_id]
@@ -212,7 +222,7 @@ def test_decode_step_records_automatic_preemption_and_kv_snapshot(
     )
     scheduler.add(seq1)
     scheduler.add(seq2)
-    prefill_seqs, is_prefill = scheduler.schedule()
+    prefill_seqs, is_prefill = schedule_legacy(scheduler)
     scheduler.postprocess(prefill_seqs, token_ids=[90, 91], is_prefill=is_prefill)
     assert len(scheduler.block_manager.free_block_ids) == 0
 

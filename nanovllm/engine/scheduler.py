@@ -4,7 +4,7 @@ from nanovllm.config import Config, SCHEDULER_POLICIES
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.stats import EngineStats
-
+from nanovllm.engine.scheduler_output import LegacySchedulerOutput
 
 class Scheduler:
 
@@ -37,7 +37,7 @@ class Scheduler:
             # arrival 的口径是“成功进入 Scheduler.waiting”，不包含 tokenizer 时间。
             self.stats.record_arrival(seq.seq_id)
 
-    def schedule(self) -> tuple[list[Sequence], bool]:
+    def schedule(self) -> LegacySchedulerOutput:
         # 根据策略选择本 Step 先尝试 Prefill 还是 Decode。
         for is_prefill, phase in self._phase_order():
             scheduled_seqs = phase()
@@ -47,7 +47,17 @@ class Scheduler:
                     self.decode_steps_since_prefill = 0
                 else:
                     self.decode_steps_since_prefill += 1
-                return scheduled_seqs, is_prefill
+                return LegacySchedulerOutput(
+                    scheduled_seqs=scheduled_seqs,
+                    num_scheduled_tokens={
+                        seq.seq_id: seq.num_scheduled_tokens
+                        for seq in scheduled_seqs
+                    },
+                    total_num_scheduled_tokens=sum(
+                        seq.num_scheduled_tokens for seq in scheduled_seqs
+                    ),
+                    is_prefill=is_prefill,
+                )
         raise RuntimeError("Scheduler 没有可调度的请求")
 
     def _phase_order(self):

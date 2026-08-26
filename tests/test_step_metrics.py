@@ -3,6 +3,7 @@ from types import SimpleNamespace
 import pytest
 
 from nanovllm.engine.llm_engine import LLMEngine
+from nanovllm.engine.scheduler_output import LegacySchedulerOutput
 from nanovllm.engine.stats import EngineStats
 from nanovllm.sampling_params import SamplingParams
 
@@ -48,7 +49,17 @@ class FakeScheduler:
 
     def schedule(self):
         self.clock.set(self.schedule_time)
-        return self.seqs, self.is_prefill
+        return LegacySchedulerOutput(
+            scheduled_seqs=self.seqs,
+            num_scheduled_tokens={
+                seq.seq_id: seq.num_scheduled_tokens
+                for seq in self.seqs
+            },
+            total_num_scheduled_tokens=sum(
+                seq.num_scheduled_tokens for seq in self.seqs
+            ),
+            is_prefill=self.is_prefill,
+        )
 
     def postprocess(self, seqs, token_ids, is_prefill):
         assert seqs == self.seqs

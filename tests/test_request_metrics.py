@@ -3,9 +3,19 @@ from types import SimpleNamespace
 import pytest
 
 from nanovllm.engine.scheduler import Scheduler
+from nanovllm.engine.scheduler_output import LegacySchedulerOutput
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.stats import EngineStats
 from nanovllm.sampling_params import SamplingParams
+
+
+def schedule_legacy(scheduler: Scheduler):
+    output = scheduler.schedule()
+    assert isinstance(output, LegacySchedulerOutput)
+    assert output.total_num_scheduled_tokens == sum(
+        output.num_scheduled_tokens.values()
+    )
+    return output.scheduled_seqs, output.is_prefill
 
 
 class FakeClock:
@@ -84,7 +94,7 @@ def test_chunked_prefill_records_real_request_timeline(
     scheduler.add(seq)
 
     clock.set(1.0)
-    first_seqs, is_prefill = scheduler.schedule()
+    first_seqs, is_prefill = schedule_legacy(scheduler)
     clock.set(2.0)
     scheduler.postprocess(first_seqs, token_ids=[89], is_prefill=is_prefill)
 
@@ -95,12 +105,12 @@ def test_chunked_prefill_records_real_request_timeline(
     assert metrics.first_token_time is None
 
     clock.set(3.0)
-    second_seqs, is_prefill = scheduler.schedule()
+    second_seqs, is_prefill = schedule_legacy(scheduler)
     clock.set(5.0)
     scheduler.postprocess(second_seqs, token_ids=[90], is_prefill=is_prefill)
 
     clock.set(6.0)
-    decode_seqs, is_prefill = scheduler.schedule()
+    decode_seqs, is_prefill = schedule_legacy(scheduler)
     clock.set(8.0)
     scheduler.postprocess(decode_seqs, token_ids=[91], is_prefill=is_prefill)
 
@@ -141,7 +151,7 @@ def test_preemption_preserves_request_timeline(monkeypatch: pytest.MonkeyPatch):
     scheduler.add(seq)
 
     clock.set(12.0)
-    prefill_seqs, is_prefill = scheduler.schedule()
+    prefill_seqs, is_prefill = schedule_legacy(scheduler)
     clock.set(15.0)
     scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
 
@@ -155,7 +165,7 @@ def test_preemption_preserves_request_timeline(monkeypatch: pytest.MonkeyPatch):
     assert metrics.request_finish_time is None
 
     clock.set(25.0)
-    recompute_seqs, is_prefill = scheduler.schedule()
+    recompute_seqs, is_prefill = schedule_legacy(scheduler)
     clock.set(30.0)
     scheduler.postprocess(recompute_seqs, token_ids=[91], is_prefill=is_prefill)
 
@@ -192,12 +202,12 @@ def test_eos_records_output_and_finish_time(monkeypatch: pytest.MonkeyPatch):
     scheduler.add(seq)
 
     clock.set(101.0)
-    prefill_seqs, is_prefill = scheduler.schedule()
+    prefill_seqs, is_prefill = schedule_legacy(scheduler)
     clock.set(103.0)
     scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
 
     clock.set(104.0)
-    decode_seqs, is_prefill = scheduler.schedule()
+    decode_seqs, is_prefill = schedule_legacy(scheduler)
     clock.set(110.0)
     scheduler.postprocess(decode_seqs, token_ids=[99], is_prefill=is_prefill)
 
@@ -234,7 +244,7 @@ def test_scheduler_without_stats_keeps_original_behavior(
     )
     scheduler.add(seq)
 
-    scheduled_seqs, is_prefill = scheduler.schedule()
+    scheduled_seqs, is_prefill = schedule_legacy(scheduler)
     scheduler.postprocess(scheduled_seqs, token_ids=[90], is_prefill=is_prefill)
 
     assert scheduler.stats is None
