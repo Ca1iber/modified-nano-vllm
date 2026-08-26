@@ -517,7 +517,89 @@ P0.4e 完成证据：
 `num_computed_tokens` 追赶 `num_tokens_with_spec`。nano-vLLM 只实现当前模型和单机实验
 需要的最小版本，不机械复制 vLLM 的异步、投机解码和多模态扩展。
 
+#### P1.2a SchedulerOutput 契约
+
+先定义 Scheduler 与 Engine/ModelRunner 之间的新边界，不立即修改 Attention：
+
+```python
+@dataclass
+class SchedulerOutput:
+    seqs: list[Sequence]
+    num_scheduled_tokens: list[int]
+    total_num_scheduled_tokens: int
+```
+
+要求：
+
+- `seq.num_scheduled_tokens` 与输出中的对应值保持一致。
+- `num_scheduled_tokens` 为正整数，且未调度的 Sequence 必须为 0。
+- `total_num_scheduled_tokens` 不超过 token budget。
+- 暂时保留 P1.1 的纯 Prefill/纯 Decode 执行路径，旧的 `is_prefill` 只作为兼容适配值。
+
 验收：
+
+- CPU 测试覆盖空队列、单请求、Chunked Prefill、Decode 和 token budget 边界。
+- P1.1 的输出、状态和 KV block 测试全部保持通过。
+
+#### P1.2b 统一候选与 Token Budget 分配
+
+将 `waiting` 和 `running` 转换为本轮的调度候选顺序。P1.1 的策略只负责排序：
+
+- `prefill_first`：waiting 候选优先；
+- `decode_first`：running 候选优先；
+- `time_sliced`：根据最近的连续调度量调整优先级。
+
+对每个候选请求计算：
+
+```text
+pending_tokens = seq.num_tokens - seq.num_cached_tokens
+scheduled_tokens = min(pending_tokens, remaining_budget)
+```
+
+要求：
+
+- 允许同一轮同时选择 waiting 和 running 请求；
+- 每个请求可以获得不同数量的 token；
+- KV block 分配必须按照本轮实际需要的 token 数进行；
+- 暂时无法分配的请求不能破坏已经选中的请求，也不能造成死循环。
+
+验收：
+
+- CPU 测试覆盖 `Decode(1) + Prefill(N)` 混合调度计划，但此阶段只验证 Scheduler
+  输出，不执行真实混合 Attention。
+- 验证 token budget、KV block、Prefix Cache、抢占和资源释放不变量。
+
+#### P1.2c 按请求更新状态与采样边界
+
+删除 `postprocess(seqs, token_ids, is_prefill)` 对全局 phase 的依赖，改为根据每个
+Sequence 本轮的计算区间判断：
+
+- `num_cached_tokens` 增加本轮实际计算量；
+- Chunked Prefill 尚未到达 Prompt 尾部时不产生输出 token；
+- 本轮完成 Prompt 的请求可以产生第一个输出 token；
+- Decode 请求每轮产生一个输出 token；
+- 完成、EOS、抢占和 Prefix Cache hash 更新保持原有语义。
+
+必要时由 SchedulerOutput 携带 `sample_indices`，明确哪些请求的 logits 需要采样。
+
+验收：
+
+- Partial Prefill、Prefill 完成、Decode、EOS 和 max_tokens 边界测试通过；
+- 三种 P1.1 策略最终 token 序列完全一致；
+- 所有完成请求的 block_table 清空且 `ref_count=0`。
+
+#### P1.2d 兼容层与旧字段收敛
+
+在 SchedulerOutput 和 per-request 状态稳定后，再逐步移除：
+
+- `Scheduler.schedule()` 返回值中的全局 `is_prefill`；
+- `LLMEngine.step()` 中按全局 phase 统计 token 的逻辑；
+- `Sequence.is_prefill` 作为持久化状态的用途。
+
+这一小项只负责收敛接口，不实现 Attention 混合执行。完成后，P1.3 才开始改
+ModelRunner metadata。
+
+P1.2 总体验收：
 
 - 一个 Step 可以为不同 Sequence 分配不同数量的 token。
 - 所有请求的 `num_scheduled_tokens` 之和不超过 token budget。
