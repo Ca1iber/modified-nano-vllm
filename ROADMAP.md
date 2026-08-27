@@ -596,7 +596,7 @@ Sequence 本轮的计算区间判断：
 - Decode 请求每轮产生一个输出 token；
 - 完成、EOS、抢占和 Prefix Cache hash 更新保持原有语义。
 
-必要时由 SchedulerOutput 携带 `sample_indices`，明确哪些请求的 logits 需要采样。
+必要时由 SchedulerOutput 携带 `should_sample`，明确哪些请求的 logits 需要采样。
 
 验收：
 

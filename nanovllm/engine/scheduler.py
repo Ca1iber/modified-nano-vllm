@@ -55,7 +55,7 @@ class Scheduler:
 
     def _schedule_legacy(self) -> LegacySchedulerOutput:
         # 根据策略选择本 Step 先尝试 Prefill 还是 Decode。
-        for is_prefill, phase in self._phase_order():
+        for is_prefill, phase in self._phase_order_legacy():
             scheduled_seqs = phase()
             if scheduled_seqs:
                 self._record_scheduled(scheduled_seqs)
@@ -77,31 +77,43 @@ class Scheduler:
         raise RuntimeError("Scheduler 没有可调度的请求")
 
     def _schedule_unified(self) -> UnifiedSchedulerOutput:
-        raise NotImplementedError(
-            'Unified Scheduler 尚未实现'
-        )
+        scheduled_seqs: list[Sequence] = []
+        # 用来表征某个 Sequence 是在 prefill 还是在 decode
+        is_prefilling: list[bool] = []
+        # 用来区分某个 Sequence 是否需要采样出新 token
+        sampling_indices: list[bool] = []
+        token_budget = self.max_num_batched_tokens
 
-    def _phase_order(self):
+
+        # 先处理 running 请求
+
+
+        # 再处理 waiting 请求
+
+
+        raise NotImplementedError("Unified Scheduler 尚未实现")
+
+    def _phase_order_legacy(self):
         """返回本轮的候选阶段；阶段函数只负责尝试调度，不负责计时或计数。"""
         if self.scheduler_policy == "prefill_first":
-            return ((True, self._schedule_prefill), (False, self._schedule_decode))
+            return ((True, self._schedule_prefill_legacy), (False, self._schedule_decode_legacy))
         if self.scheduler_policy == "decode_first":
-            return ((False, self._schedule_decode), (True, self._schedule_prefill))
+            return ((False, self._schedule_decode_legacy), (True, self._schedule_prefill_legacy))
         # time_sliced：达到 Decode 配额且确实有等待请求时，优先给等待请求一次机会。
         if (
             self.waiting
             and self.running
             and self.decode_steps_since_prefill >= self.time_sliced_decode_steps
         ):
-            return ((True, self._schedule_prefill), (False, self._schedule_decode))
-        return ((False, self._schedule_decode), (True, self._schedule_prefill))
+            return ((True, self._schedule_prefill_legacy), (False, self._schedule_decode_legacy))
+        return ((False, self._schedule_decode_legacy), (True, self._schedule_prefill_legacy))
 
     def _record_scheduled(self, scheduled_seqs: list[Sequence]):
         """把真正进入本 Step 的请求登记到统计对象；关闭统计时不做任何操作。"""
         if self.stats is not None:
             self.stats.record_scheduled([seq.seq_id for seq in scheduled_seqs])
 
-    def _schedule_prefill(self) -> list[Sequence]:
+    def _schedule_prefill_legacy(self) -> list[Sequence]:
         # scheduled_seqs = 当前 Prefill Step 具体让谁上 GPU
         scheduled_seqs = []
         num_batched_tokens = 0
@@ -151,7 +163,7 @@ class Scheduler:
 
         return []
 
-    def _schedule_decode(self) -> list[Sequence]:
+    def _schedule_decode_legacy(self) -> list[Sequence]:
         # Decode Step 中，每个被选中的 running 请求只计算一个 token。
         scheduled_seqs = []
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
