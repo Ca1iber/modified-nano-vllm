@@ -175,9 +175,9 @@ def test_reallocating_cached_block_invalidates_old_hash(
 
 
 # 场景：block_size=4，Prefill 后追加生成 token，使 Sequence 长度依次到达 5、6、7、8、9。
-# 验证 may_append 只在长度 5 和 9（新逻辑 Block 的第一个 token）分配物理 Block，
+# 验证 allocate_slots 只在长度 5 和 9（新逻辑 Block 的第一个 token）分配物理 Block，
 # 长度 6～8 仍复用当前尾块，避免少分配导致越界或每个 token 都错误分配新 Block。
-def test_may_append_allocates_only_at_block_boundaries(
+def test_allocate_slots_allocates_only_at_block_boundaries(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """Decode allocates a physical block only when entering a new logical block."""
@@ -192,28 +192,34 @@ def test_may_append_allocates_only_at_block_boundaries(
     manager.allocate(seq, num_cached_blocks=manager.can_allocate(seq))
     assert len(seq.block_table) == 1
 
-    # Prefill 采样首 token 后长度为 5；下一轮 Decode 前必须分配第二个物理 Block。
+    # 模拟完整 Prefill 已经写入 4 个 KV token；随后追加首个生成 token。
+    # 下一轮 Decode 前，新增 token 位于第二个逻辑 Block，需要分配第二个物理 Block。
+    seq.num_cached_tokens = 4
     seq.append_token(14)
-    assert manager.can_append(seq) is True
-    manager.may_append(seq)
+    assert manager.can_allocate_slots(seq) is True
+    manager.allocate_slots(seq)
     assert len(seq.block_table) == 2
     assert len(seq.block_table) == seq.num_blocks
 
     # 长度 6、7、8 都仍位于第二个逻辑 Block，不应重复分配。
+    seq.num_cached_tokens += 1
     seq.append_token(15)
-    manager.may_append(seq)
+    manager.allocate_slots(seq)
     assert len(seq.block_table) == 2
+    seq.num_cached_tokens += 1
     seq.append_token(16)
-    manager.may_append(seq)
+    manager.allocate_slots(seq)
     assert len(seq.block_table) == 2
+    seq.num_cached_tokens += 1
     seq.append_token(17)
-    manager.may_append(seq)
+    manager.allocate_slots(seq)
     assert len(seq.block_table) == 2
 
     # 长度 9 跨入第三个逻辑 Block，因此再次分配一个物理 Block。
+    seq.num_cached_tokens += 1
     seq.append_token(18)
-    assert manager.can_append(seq) is True
-    manager.may_append(seq)
+    assert manager.can_allocate_slots(seq) is True
+    manager.allocate_slots(seq)
     assert len(seq.block_table) == 3
     assert len(seq.block_table) == seq.num_blocks
     assert manager.used_block_ids == set(seq.block_table)

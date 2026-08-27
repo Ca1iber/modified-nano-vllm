@@ -102,7 +102,7 @@ class Scheduler:
             if token_budget == 0:
                 break
 
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_allocate_slots(seq):
                 if self.running:
                     victim = self.running.pop()
                 else:
@@ -213,7 +213,7 @@ class Scheduler:
         while self.running and len(scheduled_seqs) < self.max_num_seqs:
             seq = self.running.popleft()
             # 当前 Sequence 没有足够的 KV Cache 空间容纳这次 Decode token，因此需要先释放空间
-            while not self.block_manager.can_append(seq):
+            while not self.block_manager.can_allocate_slots(seq):
                 if self.running:    # running 中还有其他 seq
                     self.preempt(self.running.pop())    # 抢占其他请求
                 else:
@@ -223,7 +223,7 @@ class Scheduler:
                 seq.num_scheduled_tokens = 1
                 seq.is_prefill = False
                 # 如果新 token 正好跨入一个新逻辑 block，就分配一个新的物理 KV block
-                self.block_manager.may_append(seq)
+                self.block_manager.allocate_slots(seq)
                 scheduled_seqs.append(seq)
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs))

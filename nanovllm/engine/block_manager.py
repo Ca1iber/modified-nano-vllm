@@ -118,20 +118,17 @@ class BlockManager:
         seq.num_cached_tokens = 0
         seq.block_table.clear()
 
-    # decode 的当前 token 若位于新逻辑 block 的开头，则检查是否至少还有一个空闲物理 block。
+    # 检查是否剩余足够多的 kv blocks 可以分配
     # 新增 num_new_tokens 且默认为 1 以兼容 Legacy
-    def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)    
-        # 后面这段判断 > Sequence 当前最后一个 token，是不是一个新逻辑 KV block 的第一个 token
-        #   need_new_block = len(seq) % self.block_size == 1
-        #   if need_new_block:
-        #       return len(self.free_block_ids) >= 1
-        #   return True        
+    def can_allocate_slots(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
+        num_required_new_blocks = self._num_required_new_blocks(seq, num_new_tokens)
+        return len(self.free_block_ids) >= num_required_new_blocks
 
-    # decode 跨入新逻辑 block 时，为 Sequence 的 block_table 追加一个新物理 block id。
+    # 分配 kv blocks
     # 新增 num_new_tokens 且默认为 1 以兼容 Legacy
-    def may_append(self, seq: Sequence, num_new_tokens: int = 1):
-        if len(seq) % self.block_size == 1:
+    def allocate_slots(self, seq: Sequence, num_new_tokens: int = 1):
+        num_required_new_blocks = self._num_required_new_blocks(seq, num_new_tokens)
+        for _ in range(num_required_new_blocks):
             seq.block_table.append(self._allocate_block())
 
     # 找出本轮新计算完整的 token blocks，为其生成链式 hash 并写入 Block 元数据。
