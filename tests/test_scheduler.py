@@ -3,7 +3,10 @@ from types import SimpleNamespace
 import pytest
 
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.scheduler_output import LegacySchedulerOutput
+from nanovllm.engine.scheduler_output import (
+    LegacySchedulerOutput,
+    UnifiedSchedulerOutput,
+)
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.sampling_params import SamplingParams
 
@@ -13,6 +16,20 @@ def schedule_legacy(scheduler: Scheduler):
     assert isinstance(output, LegacySchedulerOutput)
     assert output.total_num_scheduled_tokens == sum(
         seq.num_scheduled_tokens for seq in output.scheduled_seqs
+    )
+    return output
+
+
+def schedule_unified(scheduler: Scheduler):
+    output = scheduler.schedule()
+    assert isinstance(output, UnifiedSchedulerOutput)
+    assert output.total_num_scheduled_tokens == sum(
+        seq.num_scheduled_tokens for seq in output.scheduled_seqs
+    )
+    assert (
+        len(output.scheduled_seqs)
+        == len(output.is_prefilling)
+        == len(output.should_sample)
     )
     return output
 
@@ -48,11 +65,61 @@ def test_scheduler_rejects_unknown_mode():
         scheduler.schedule()
 
 
-def test_unified_mode_is_explicitly_not_implemented():
+def test_unified_mode_schedules_waiting_request():
+    scheduler = Scheduler(make_scheduler_config(scheduler_mode="unified"))
+    seq = Sequence([10, 11], SamplingParams(max_tokens=1))
+    scheduler.add(seq)
+
+    output = schedule_unified(scheduler)
+
+    assert output.scheduled_seqs == [seq]
+    assert output.total_num_scheduled_tokens == 2
+    assert output.is_prefilling == [True]
+    assert output.should_sample == [True]
+    assert seq.status is SequenceStatus.RUNNING
+    assert seq.is_prefill is True
+    assert list(scheduler.waiting) == []
+    assert list(scheduler.running) == [seq]
+
+
+def test_unified_mode_raises_when_no_request_can_be_scheduled():
     scheduler = Scheduler(make_scheduler_config(scheduler_mode="unified"))
 
-    with pytest.raises(NotImplementedError, match="Unified Scheduler 尚未实现"):
+    with pytest.raises(RuntimeError, match="没有可以调度的请求"):
         scheduler.schedule()
+
+
+def test_unified_chunked_prefill_enters_running(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    scheduler = Scheduler(
+        make_scheduler_config(
+            scheduler_mode="unified",
+            max_num_batched_tokens=4,
+            kvcache_block_size=block_size,
+        )
+    )
+    seq = Sequence(
+        token_ids=[10, 11, 12, 13, 14, 15],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    scheduler.add(seq)
+
+    output = schedule_unified(scheduler)
+
+    assert output.scheduled_seqs == [seq]
+    assert output.total_num_scheduled_tokens == 4
+    assert output.is_prefilling == [True]
+    assert output.should_sample == [False]
+    assert seq.num_cached_tokens == 0
+    assert seq.num_scheduled_tokens == 4
+    assert seq.status is SequenceStatus.RUNNING
+    assert seq.is_prefill is True
+    assert list(scheduler.waiting) == []
+    assert list(scheduler.running) == [seq]
+    assert len(seq.block_table) == 2
 
 
 # 场景：6-token prompt 遇到 4-token budget，第一轮只能 Prefill 前 4 个 token。

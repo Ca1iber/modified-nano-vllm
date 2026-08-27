@@ -132,7 +132,7 @@ class Scheduler:
             seq.num_scheduled_tokens = num_new_tokens
             # 3. 将请求和对应 metadata 加入列表
             scheduled_seqs.append(seq)
-            is_prefilling.append(False)
+            is_prefilling.append(seq.is_prefill)
             should_sample.append(
                 seq.num_cached_tokens + num_new_tokens == seq.num_tokens
             )
@@ -151,8 +151,56 @@ class Scheduler:
                 if token_budget == 0:
                     break
 
+                # block_table 为空
+                # -> 新请求或被抢占后重算
+                # -> 需要 Prefix Cache 查询和首次分配
+                if not seq.block_table:
+                    num_cached_blocks = self.block_manager.can_allocate(seq)
 
-        raise NotImplementedError("Unified Scheduler 尚未实现")
+                    if num_cached_blocks == -1:
+                        break
+
+                    self.block_manager.allocate(seq, num_cached_blocks)
+
+                # block_table 非空
+                # -> 上一轮 chunked prefill 尚未完成
+                # -> 继续使用已有 block_table
+                # 或已经分配完, 直接接着用
+                num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+                num_new_tokens = min(num_new_tokens, token_budget)
+
+                if num_new_tokens == 0:
+                    continue
+
+                seq.num_scheduled_tokens = num_new_tokens
+                scheduled_seqs.append(seq)
+                is_prefilling.append(True)
+                should_sample.append(
+                    seq.num_cached_tokens + num_new_tokens == seq.num_tokens
+                )
+                token_budget -= num_new_tokens
+
+                # in Unified mode, as long as a Sequence in "waiting" is
+                # successfully scheduled and allocated blocks, then it shall
+                # be removed from "waiting" and added into "running" even if
+                # it is still chunked prefilling.
+                self.waiting.remove(seq)
+                self.running.append(seq)
+                seq.status = SequenceStatus.RUNNING
+
+
+        if not scheduled_seqs:
+            raise RuntimeError("Scheduler 没有可以调度的请求")
+
+        self._record_scheduled(scheduled_seqs)
+        total_scheduled_tokens = sum(seq.num_scheduled_tokens for seq in scheduled_seqs)
+
+        return UnifiedSchedulerOutput(
+            scheduled_seqs=scheduled_seqs,
+            total_num_scheduled_tokens=total_scheduled_tokens,
+            should_sample=should_sample,
+            is_prefilling=is_prefilling,
+        )
 
     def _phase_order_legacy(self):
         """返回本轮的候选阶段；阶段函数只负责尝试调度，不负责计时或计数。"""
