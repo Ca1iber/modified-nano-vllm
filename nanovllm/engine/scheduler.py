@@ -102,25 +102,42 @@ class Scheduler:
             if token_budget == 0:
                 break
 
-            while not self.block_manager.can_allocate_slots(seq):
+            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            num_new_tokens = min(num_new_tokens, token_budget)
+
+            if num_new_tokens == 0:
+                continue
+
+            # kv cache 不够，抢占！
+            while not self.block_manager.can_allocate_slots(seq, num_new_tokens):
                 if self.running:
                     victim = self.running.pop()
                 else:
                     victim = seq
 
+                # 放回 waiting 队列的操作在此完成
                 self.preempt(victim)
                 preemption_happened = True
 
                 if victim is seq:
                     break
 
-            # 防止抢占之后继续执行后续 decode 逻辑
+            # 防止抢占自己之后继续执行后续 decode 逻辑
             if seq.status is not SequenceStatus.RUNNING:
                 continue
 
-            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
-            num_new_tokens = min(num_new_tokens, token_budget)
-
+            # 1. 分配真正的 kv cache
+            self.block_manager.allocate_slots(seq, num_new_tokens)
+            # 2. 保存本轮实际调度的 token 数
+            seq.num_scheduled_tokens = num_new_tokens
+            # 3. 将请求和对应 metadata 加入列表
+            scheduled_seqs.append(seq)
+            is_prefilling.append(False)
+            should_sample.append(
+                seq.num_cached_tokens + num_new_tokens == seq.num_tokens
+            )
+            # 4.最后扣除预算
+            token_budget -= num_new_tokens
 
         # 再处理 waiting 请求
         if not preemption_happened:
