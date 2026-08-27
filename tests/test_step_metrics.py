@@ -51,22 +51,18 @@ class FakeScheduler:
         self.clock.set(self.schedule_time)
         return LegacySchedulerOutput(
             scheduled_seqs=self.seqs,
-            num_scheduled_tokens={
-                seq.seq_id: seq.num_scheduled_tokens
-                for seq in self.seqs
-            },
             total_num_scheduled_tokens=sum(
                 seq.num_scheduled_tokens for seq in self.seqs
             ),
             is_prefill=self.is_prefill,
         )
 
-    def postprocess(self, seqs, token_ids, is_prefill):
-        assert seqs == self.seqs
-        assert len(token_ids) == len(seqs)
-        assert is_prefill is self.is_prefill
+    def postprocess(self, scheduler_output, token_ids):
+        assert scheduler_output.scheduled_seqs == self.seqs
+        assert len(token_ids) == len(scheduler_output.scheduled_seqs)
+        assert scheduler_output.is_prefill is self.is_prefill
         # 真实 Scheduler.postprocess() 也会把本轮 scheduled token 清零。
-        for seq in seqs:
+        for seq in scheduler_output.scheduled_seqs:
             seq.num_scheduled_tokens = 0
         self.clock.set(self.postprocess_time)
 

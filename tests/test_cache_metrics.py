@@ -14,9 +14,9 @@ def schedule_legacy(scheduler: Scheduler):
     output = scheduler.schedule()
     assert isinstance(output, LegacySchedulerOutput)
     assert output.total_num_scheduled_tokens == sum(
-        output.num_scheduled_tokens.values()
+        seq.num_scheduled_tokens for seq in output.scheduled_seqs
     )
-    return output.scheduled_seqs, output.is_prefill
+    return output
 
 
 class FakeModelRunner:
@@ -73,8 +73,10 @@ def test_preemption_records_cached_tokens_references_and_freed_blocks(
     )
     scheduler.add(seq)
 
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
+    scheduler.postprocess(prefill_seqs_output, token_ids=[90])
 
     assert seq.num_cached_tokens == 6
     assert len(seq.block_table) == 2
@@ -109,11 +111,15 @@ def test_preemption_does_not_count_shared_block_as_freed(
     )
 
     scheduler.add(seq1)
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
+    scheduler.postprocess(prefill_seqs_output, token_ids=[90])
     scheduler.add(seq2)
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(prefill_seqs, token_ids=[91], is_prefill=is_prefill)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
+    scheduler.postprocess(prefill_seqs_output, token_ids=[91])
 
     shared_block_id = seq1.block_table[0]
     seq1_private_block_id = seq1.block_table[1]
@@ -146,8 +152,10 @@ def test_recompute_counts_only_previously_computed_uncached_tokens(
         sampling_params=SamplingParams(max_tokens=3),
     )
     scheduler.add(seq)
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
+    scheduler.postprocess(prefill_seqs_output, token_ids=[90])
 
     scheduler.running.remove(seq)
     scheduler.preempt(seq)
@@ -187,10 +195,14 @@ def test_chunked_prefill_is_not_recompute(monkeypatch: pytest.MonkeyPatch):
     )
     scheduler.add(seq)
 
-    first_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(first_seqs, token_ids=[89], is_prefill=is_prefill)
-    second_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(second_seqs, token_ids=[90], is_prefill=is_prefill)
+    first_seqs_output = schedule_legacy(scheduler)
+    first_seqs = first_seqs_output.scheduled_seqs
+    is_prefill = first_seqs_output.is_prefill
+    scheduler.postprocess(first_seqs_output, token_ids=[89])
+    second_seqs_output = schedule_legacy(scheduler)
+    second_seqs = second_seqs_output.scheduled_seqs
+    is_prefill = second_seqs_output.is_prefill
+    scheduler.postprocess(second_seqs_output, token_ids=[90])
 
     metrics = stats.requests[seq.seq_id]
     assert metrics.preemption_count == 0
@@ -222,8 +234,10 @@ def test_decode_step_records_automatic_preemption_and_kv_snapshot(
     )
     scheduler.add(seq1)
     scheduler.add(seq2)
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(prefill_seqs, token_ids=[90, 91], is_prefill=is_prefill)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
+    scheduler.postprocess(prefill_seqs_output, token_ids=[90, 91])
     assert len(scheduler.block_manager.free_block_ids) == 0
 
     engine = make_test_engine(scheduler, stats, token_id=92)

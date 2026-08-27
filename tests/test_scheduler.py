@@ -12,9 +12,9 @@ def schedule_legacy(scheduler: Scheduler):
     output = scheduler.schedule()
     assert isinstance(output, LegacySchedulerOutput)
     assert output.total_num_scheduled_tokens == sum(
-        output.num_scheduled_tokens.values()
+        seq.num_scheduled_tokens for seq in output.scheduled_seqs
     )
-    return output.scheduled_seqs, output.is_prefill
+    return output
 
 
 def make_scheduler_config(**kwargs):
@@ -80,7 +80,9 @@ def test_chunked_prefill_first_step_respects_token_budget(
     )
     scheduler.add(seq)
 
-    scheduled_seqs, is_prefill = schedule_legacy(scheduler)
+    scheduled_seqs_output = schedule_legacy(scheduler)
+    scheduled_seqs = scheduled_seqs_output.scheduled_seqs
+    is_prefill = scheduled_seqs_output.is_prefill
 
     assert is_prefill is True
     assert scheduled_seqs == [seq]
@@ -100,7 +102,7 @@ def test_chunked_prefill_first_step_respects_token_budget(
     )
 
     # An incomplete prefill chunk must advance cached progress but discard sampling.
-    scheduler.postprocess(scheduled_seqs, token_ids=[90], is_prefill=is_prefill)
+    scheduler.postprocess(scheduled_seqs_output, token_ids=[90])
 
     assert seq.num_cached_tokens == 4
     assert seq.num_scheduled_tokens == 0
@@ -137,7 +139,9 @@ def test_chunked_prefill_completes_across_multiple_steps(
 
     assert seq.num_cached_tokens == 0
 
-    first_seqs, is_prefill = schedule_legacy(scheduler)
+    first_seqs_output = schedule_legacy(scheduler)
+    first_seqs = first_seqs_output.scheduled_seqs
+    is_prefill = first_seqs_output.is_prefill
 
     assert is_prefill is True
     assert first_seqs == [seq]
@@ -147,7 +151,7 @@ def test_chunked_prefill_completes_across_multiple_steps(
     first_block_table = list(seq.block_table)
 
     # The first chunk is committed, but its sampled candidate is not generated output.
-    scheduler.postprocess(first_seqs, token_ids=[90], is_prefill=is_prefill)
+    scheduler.postprocess(first_seqs_output, token_ids=[90])
 
     assert seq.num_cached_tokens == 4
     assert seq.num_scheduled_tokens == 0
@@ -156,7 +160,9 @@ def test_chunked_prefill_completes_across_multiple_steps(
     assert list(scheduler.waiting) == [seq]
     assert list(scheduler.running) == []
 
-    second_seqs, is_prefill = schedule_legacy(scheduler)
+    second_seqs_output = schedule_legacy(scheduler)
+    second_seqs = second_seqs_output.scheduled_seqs
+    is_prefill = second_seqs_output.is_prefill
 
     assert is_prefill is True
     assert second_seqs == [seq]
@@ -168,7 +174,7 @@ def test_chunked_prefill_completes_across_multiple_steps(
     assert list(scheduler.running) == [seq]
 
     # The second chunk completes the prompt, so its sampled token is now accepted.
-    scheduler.postprocess(second_seqs, token_ids=[91], is_prefill=is_prefill)
+    scheduler.postprocess(second_seqs_output, token_ids=[91])
 
     assert seq.num_cached_tokens == 6
     assert seq.num_scheduled_tokens == 0
@@ -203,7 +209,9 @@ def test_complete_prefill_moves_to_running_and_appends_first_token(
     )
     scheduler.add(seq)
 
-    scheduled_seqs, is_prefill = schedule_legacy(scheduler)
+    scheduled_seqs_output = schedule_legacy(scheduler)
+    scheduled_seqs = scheduled_seqs_output.scheduled_seqs
+    is_prefill = scheduled_seqs_output.is_prefill
 
     assert is_prefill is True
     assert scheduled_seqs == [seq]
@@ -214,7 +222,7 @@ def test_complete_prefill_moves_to_running_and_appends_first_token(
     assert list(scheduler.running) == [seq]
 
     # Simulate the model returning the first generated token after full prefill.
-    scheduler.postprocess(scheduled_seqs, token_ids=[90], is_prefill=is_prefill)
+    scheduler.postprocess(scheduled_seqs_output, token_ids=[90])
 
     assert seq.num_cached_tokens == 4
     assert seq.num_scheduled_tokens == 0
@@ -250,14 +258,18 @@ def test_decode_reaches_max_tokens_and_releases_blocks(
     scheduler.add(seq)
 
     # Complete prefill and record the first generated token.
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
+    scheduler.postprocess(prefill_seqs_output, token_ids=[90])
 
     assert seq.completion_token_ids == [90]
     assert seq.status is SequenceStatus.RUNNING
 
     # The next step is decode: token 90 is computed and token 91 is sampled.
-    decode_seqs, is_prefill = schedule_legacy(scheduler)
+    decode_seqs_output = schedule_legacy(scheduler)
+    decode_seqs = decode_seqs_output.scheduled_seqs
+    is_prefill = decode_seqs_output.is_prefill
 
     assert is_prefill is False
     assert decode_seqs == [seq]
@@ -266,7 +278,7 @@ def test_decode_reaches_max_tokens_and_releases_blocks(
     assert seq.is_prefill is False
     assert len(seq.block_table) == 2
 
-    scheduler.postprocess(decode_seqs, token_ids=[91], is_prefill=is_prefill)
+    scheduler.postprocess(decode_seqs_output, token_ids=[91])
 
     assert seq.completion_token_ids == [90, 91]
     assert seq.num_completion_tokens == 2
@@ -316,7 +328,9 @@ def test_prefill_batch_does_not_exceed_token_budget_with_multiple_sequences(
     scheduler.add(seq2)
     scheduler.add(seq3)
 
-    scheduled_seqs, is_prefill = schedule_legacy(scheduler)
+    scheduled_seqs_output = schedule_legacy(scheduler)
+    scheduled_seqs = scheduled_seqs_output.scheduled_seqs
+    is_prefill = scheduled_seqs_output.is_prefill
 
     total_scheduled_tokens = sum(
         seq.num_scheduled_tokens for seq in scheduled_seqs
@@ -361,8 +375,10 @@ def test_prefill_first_prioritizes_waiting_prompt_over_running_decode(
     scheduler.add(decode_seq)
 
     # Move request A into running and give it its first generated token.
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
+    scheduler.postprocess(prefill_seqs_output, token_ids=[90])
 
     assert decode_seq.status is SequenceStatus.RUNNING
     assert decode_seq.completion_token_ids == [90]
@@ -377,7 +393,9 @@ def test_prefill_first_prioritizes_waiting_prompt_over_running_decode(
     assert list(scheduler.running) == [decode_seq]
     assert list(scheduler.waiting) == [prefill_seq]
 
-    scheduled_seqs, is_prefill = schedule_legacy(scheduler)
+    scheduled_seqs_output = schedule_legacy(scheduler)
+    scheduled_seqs = scheduled_seqs_output.scheduled_seqs
+    is_prefill = scheduled_seqs_output.is_prefill
 
     assert is_prefill is True
     assert scheduled_seqs == [prefill_seq]
@@ -410,19 +428,25 @@ def test_decode_first_prioritizes_running_decode_over_waiting_prefill(
     waiting_seq = Sequence([20, 21, 22, 23], SamplingParams(max_tokens=2))
     scheduler.add(running_seq)
 
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
     assert is_prefill is True  # 冷启动没有 running，只能先完成 Prefill。
-    scheduler.postprocess(prefill_seqs, [90], is_prefill)
+    scheduler.postprocess(prefill_seqs_output, [90])
     scheduler.add(waiting_seq)
 
-    decode_seqs, is_prefill = schedule_legacy(scheduler)
+    decode_seqs_output = schedule_legacy(scheduler)
+    decode_seqs = decode_seqs_output.scheduled_seqs
+    is_prefill = decode_seqs_output.is_prefill
     assert is_prefill is False
     assert decode_seqs == [running_seq]
     assert list(scheduler.waiting) == [waiting_seq]
 
     # running 请求完成后，decode_first 仍能回退到 waiting 队列完成 Prefill。
-    scheduler.postprocess(decode_seqs, [91], is_prefill)
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
+    scheduler.postprocess(decode_seqs_output, [91])
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
     assert is_prefill is True
     assert prefill_seqs == [waiting_seq]
 
@@ -447,23 +471,31 @@ def test_time_sliced_switches_to_waiting_prefill_after_decode_quota(
     running_seq = Sequence([10, 11, 12, 13], SamplingParams(max_tokens=8))
     waiting_seq = Sequence([20, 21, 22, 23], SamplingParams(max_tokens=2))
     scheduler.add(running_seq)
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(prefill_seqs, [90], is_prefill)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
+    scheduler.postprocess(prefill_seqs_output, [90])
     scheduler.add(waiting_seq)
 
-    first, is_prefill = schedule_legacy(scheduler)
+    first_output = schedule_legacy(scheduler)
+    first = first_output.scheduled_seqs
+    is_prefill = first_output.is_prefill
     assert first == [running_seq]
     assert is_prefill is False
     assert scheduler.decode_steps_since_prefill == 1
-    scheduler.postprocess(first, [91], is_prefill)
+    scheduler.postprocess(first_output, [91])
 
-    second, is_prefill = schedule_legacy(scheduler)
+    second_output = schedule_legacy(scheduler)
+    second = second_output.scheduled_seqs
+    is_prefill = second_output.is_prefill
     assert second == [running_seq]
     assert is_prefill is False
     assert scheduler.decode_steps_since_prefill == 2
-    scheduler.postprocess(second, [92], is_prefill)
+    scheduler.postprocess(second_output, [92])
 
-    third, is_prefill = schedule_legacy(scheduler)
+    third_output = schedule_legacy(scheduler)
+    third = third_output.scheduled_seqs
+    is_prefill = third_output.is_prefill
     assert third == [waiting_seq]
     assert is_prefill is True
     assert scheduler.decode_steps_since_prefill == 0
@@ -504,20 +536,24 @@ def test_scheduler_policies_finish_same_outputs_and_release_all_kv_blocks(
 
     # 先让 A 完成 Prefill，再加入 B，构造 running 与 waiting 同时非空的策略分歧点。
     scheduler.add(seq_a)
-    scheduled_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(scheduled_seqs, token_ids=[100], is_prefill=is_prefill)
+    scheduled_seqs_output = schedule_legacy(scheduler)
+    scheduled_seqs = scheduled_seqs_output.scheduled_seqs
+    is_prefill = scheduled_seqs_output.is_prefill
+    scheduler.postprocess(scheduled_seqs_output, token_ids=[100])
     scheduler.add(seq_b)
 
     # CPU 测试用固定 token 代替模型输出。token 只取决于 Sequence 和已完成数量，
     # 因此即使三种策略的执行顺序不同，最终输出也应该完全一致。
     num_steps = 0
     while not scheduler.is_finished():
-        scheduled_seqs, is_prefill = schedule_legacy(scheduler)
+        scheduled_seqs_output = schedule_legacy(scheduler)
+        scheduled_seqs = scheduled_seqs_output.scheduled_seqs
+        is_prefill = scheduled_seqs_output.is_prefill
         token_ids = [
             (100 if seq is seq_a else 200) + seq.num_completion_tokens
             for seq in scheduled_seqs
         ]
-        scheduler.postprocess(scheduled_seqs, token_ids, is_prefill)
+        scheduler.postprocess(scheduled_seqs_output, token_ids)
         num_steps += 1
         assert num_steps < 20  # 防止策略错误导致测试永久循环。
 
@@ -561,8 +597,10 @@ def test_preempt_moves_running_sequence_to_waiting_and_releases_blocks(
     scheduler.add(seq)
 
     # Complete prefill so the request is running and owns a physical KV Block.
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
+    scheduler.postprocess(prefill_seqs_output, token_ids=[90])
 
     allocated_block_ids = list(seq.block_table)
     assert seq.status is SequenceStatus.RUNNING
@@ -628,20 +666,24 @@ def test_eos_finishes_sequence_early_and_releases_blocks(
     scheduler.add(seq)
 
     # Full prefill produces a normal first token, so the request keeps running.
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
+    scheduler.postprocess(prefill_seqs_output, token_ids=[90])
 
     assert seq.completion_token_ids == [90]
     assert seq.status is SequenceStatus.RUNNING
 
     # The next decode returns EOS before the request reaches max_tokens.
-    decode_seqs, is_prefill = schedule_legacy(scheduler)
+    decode_seqs_output = schedule_legacy(scheduler)
+    decode_seqs = decode_seqs_output.scheduled_seqs
+    is_prefill = decode_seqs_output.is_prefill
 
     assert is_prefill is False
     assert decode_seqs == [seq]
     assert seq.num_scheduled_tokens == 1
 
-    scheduler.postprocess(decode_seqs, token_ids=[99], is_prefill=is_prefill)
+    scheduler.postprocess(decode_seqs_output, token_ids=[99])
 
     assert seq.completion_token_ids == [90, 99]
     assert seq.num_completion_tokens == 2
@@ -688,12 +730,16 @@ def test_ignore_eos_keeps_sequence_running_and_blocks_allocated(
     )
     scheduler.add(seq)
 
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
+    scheduler.postprocess(prefill_seqs_output, token_ids=[90])
 
-    decode_seqs, is_prefill = schedule_legacy(scheduler)
+    decode_seqs_output = schedule_legacy(scheduler)
+    decode_seqs = decode_seqs_output.scheduled_seqs
+    is_prefill = decode_seqs_output.is_prefill
     assert is_prefill is False
-    scheduler.postprocess(decode_seqs, token_ids=[99], is_prefill=is_prefill)
+    scheduler.postprocess(decode_seqs_output, token_ids=[99])
 
     assert seq.completion_token_ids == [90, 99]
     assert seq.num_completion_tokens == 2

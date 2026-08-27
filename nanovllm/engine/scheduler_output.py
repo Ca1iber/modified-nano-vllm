@@ -5,7 +5,8 @@ from abc import ABC
 @dataclass(slots=True)
 class SchedulerOutput(ABC):
     scheduled_seqs: list[Sequence]
-    num_scheduled_tokens: dict[int, int]
+    # key: seq_id, value: 本 Step 实际调度的 token 数量；注意可能小于请求的 max_tokens。
+    # num_scheduled_tokens: dict[int, int]
     total_num_scheduled_tokens: int
 
     # sample_indices：P1.2c 的采样边界

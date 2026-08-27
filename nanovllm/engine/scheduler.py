@@ -4,7 +4,9 @@ from nanovllm.config import Config, SCHEDULER_POLICIES
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.block_manager import BlockManager
 from nanovllm.engine.stats import EngineStats
-from nanovllm.engine.scheduler_output import LegacySchedulerOutput, UnifiedSchedulerOutput
+from nanovllm.engine.scheduler_output import (LegacySchedulerOutput,
+                                              UnifiedSchedulerOutput,
+                                              SchedulerOutput)
 
 class Scheduler:
 
@@ -63,10 +65,10 @@ class Scheduler:
                     self.decode_steps_since_prefill += 1
                 return LegacySchedulerOutput(
                     scheduled_seqs=scheduled_seqs,
-                    num_scheduled_tokens={
-                        seq.seq_id: seq.num_scheduled_tokens
-                        for seq in scheduled_seqs
-                    },
+                    # num_scheduled_tokens={
+                    #     seq.seq_id: seq.num_scheduled_tokens
+                    #     for seq in scheduled_seqs
+                    # },
                     total_num_scheduled_tokens=sum(
                         seq.num_scheduled_tokens for seq in scheduled_seqs
                     ),
@@ -201,23 +203,49 @@ class Scheduler:
         5. 追加新生成的 token
         6. 判断请求是否结束
     '''
-    def postprocess(self, seqs: list[Sequence], token_ids: list[int], is_prefill: bool):
-        for seq, token_id in zip(seqs, token_ids):
+    def postprocess(self, scheduler_output: SchedulerOutput, token_ids: list[int]):
+        if isinstance(scheduler_output, LegacySchedulerOutput):
+            self._postprocess_legacy(scheduler_output, token_ids)
+
+        elif isinstance(scheduler_output, UnifiedSchedulerOutput):
+            self._postprocess_unified(scheduler_output, token_ids)
+
+        else:
+            raise TypeError(
+                f"不支持的 SchedulerOutput 类型: "
+                f"{type(scheduler_output).__name__}"
+            )
+
+    def _postprocess_legacy(self, scheduler_output: LegacySchedulerOutput, token_ids: list[int]):
+        for seq, token_id in zip(scheduler_output.scheduled_seqs, token_ids):
+            # 后期接口更改?
             self.block_manager.hash_blocks(seq)
+
             seq.num_cached_tokens += seq.num_scheduled_tokens
             seq.num_scheduled_tokens = 0
-            if is_prefill and seq.num_cached_tokens < seq.num_tokens:
+
+            # 还没完成 prefill
+            if (scheduler_output.is_prefill and seq.num_cached_tokens < seq.num_tokens):
                 continue
+
             seq.append_token(token_id)
+
             finished = (
                 (not seq.ignore_eos and token_id == self.eos)
                 or seq.num_completion_tokens == seq.max_tokens
             )
             if finished:
                 seq.status = SequenceStatus.FINISHED
+
             if self.stats is not None:
-                # 只有 append_token 后才是真实输出；不完整 Prefill 的临时候选不会走到这里。
                 self.stats.record_output_token(seq.seq_id, finished=finished)
+
             if finished:
                 self.block_manager.deallocate(seq)
                 self.running.remove(seq)
+
+
+    def _postprocess_unified(self, scheduler_output: UnifiedSchedulerOutput, token_ids: list[int]):
+        raise NotImplementedError(
+            '_postprocess_unified 尚未实现'
+        )

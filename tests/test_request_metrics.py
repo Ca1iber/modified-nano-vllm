@@ -13,9 +13,9 @@ def schedule_legacy(scheduler: Scheduler):
     output = scheduler.schedule()
     assert isinstance(output, LegacySchedulerOutput)
     assert output.total_num_scheduled_tokens == sum(
-        output.num_scheduled_tokens.values()
+        seq.num_scheduled_tokens for seq in output.scheduled_seqs
     )
-    return output.scheduled_seqs, output.is_prefill
+    return output
 
 
 class FakeClock:
@@ -94,9 +94,11 @@ def test_chunked_prefill_records_real_request_timeline(
     scheduler.add(seq)
 
     clock.set(1.0)
-    first_seqs, is_prefill = schedule_legacy(scheduler)
+    first_seqs_output = schedule_legacy(scheduler)
+    first_seqs = first_seqs_output.scheduled_seqs
+    is_prefill = first_seqs_output.is_prefill
     clock.set(2.0)
-    scheduler.postprocess(first_seqs, token_ids=[89], is_prefill=is_prefill)
+    scheduler.postprocess(first_seqs_output, token_ids=[89])
 
     # 第一段 Prefill 尚未覆盖完整 prompt，token 89 只是无效候选，不能进入指标。
     metrics = stats.requests[seq.seq_id]
@@ -105,14 +107,18 @@ def test_chunked_prefill_records_real_request_timeline(
     assert metrics.first_token_time is None
 
     clock.set(3.0)
-    second_seqs, is_prefill = schedule_legacy(scheduler)
+    second_seqs_output = schedule_legacy(scheduler)
+    second_seqs = second_seqs_output.scheduled_seqs
+    is_prefill = second_seqs_output.is_prefill
     clock.set(5.0)
-    scheduler.postprocess(second_seqs, token_ids=[90], is_prefill=is_prefill)
+    scheduler.postprocess(second_seqs_output, token_ids=[90])
 
     clock.set(6.0)
-    decode_seqs, is_prefill = schedule_legacy(scheduler)
+    decode_seqs_output = schedule_legacy(scheduler)
+    decode_seqs = decode_seqs_output.scheduled_seqs
+    is_prefill = decode_seqs_output.is_prefill
     clock.set(8.0)
-    scheduler.postprocess(decode_seqs, token_ids=[91], is_prefill=is_prefill)
+    scheduler.postprocess(decode_seqs_output, token_ids=[91])
 
     assert seq.status is SequenceStatus.FINISHED
     assert metrics.queue_arrival_time == 0.0
@@ -151,9 +157,11 @@ def test_preemption_preserves_request_timeline(monkeypatch: pytest.MonkeyPatch):
     scheduler.add(seq)
 
     clock.set(12.0)
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
     clock.set(15.0)
-    scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
+    scheduler.postprocess(prefill_seqs_output, token_ids=[90])
 
     clock.set(20.0)
     preempted_seq = scheduler.running.pop()
@@ -165,9 +173,11 @@ def test_preemption_preserves_request_timeline(monkeypatch: pytest.MonkeyPatch):
     assert metrics.request_finish_time is None
 
     clock.set(25.0)
-    recompute_seqs, is_prefill = schedule_legacy(scheduler)
+    recompute_seqs_output = schedule_legacy(scheduler)
+    recompute_seqs = recompute_seqs_output.scheduled_seqs
+    is_prefill = recompute_seqs_output.is_prefill
     clock.set(30.0)
-    scheduler.postprocess(recompute_seqs, token_ids=[91], is_prefill=is_prefill)
+    scheduler.postprocess(recompute_seqs_output, token_ids=[91])
 
     assert seq.status is SequenceStatus.RUNNING
     assert metrics.queue_arrival_time == 10.0
@@ -202,14 +212,18 @@ def test_eos_records_output_and_finish_time(monkeypatch: pytest.MonkeyPatch):
     scheduler.add(seq)
 
     clock.set(101.0)
-    prefill_seqs, is_prefill = schedule_legacy(scheduler)
+    prefill_seqs_output = schedule_legacy(scheduler)
+    prefill_seqs = prefill_seqs_output.scheduled_seqs
+    is_prefill = prefill_seqs_output.is_prefill
     clock.set(103.0)
-    scheduler.postprocess(prefill_seqs, token_ids=[90], is_prefill=is_prefill)
+    scheduler.postprocess(prefill_seqs_output, token_ids=[90])
 
     clock.set(104.0)
-    decode_seqs, is_prefill = schedule_legacy(scheduler)
+    decode_seqs_output = schedule_legacy(scheduler)
+    decode_seqs = decode_seqs_output.scheduled_seqs
+    is_prefill = decode_seqs_output.is_prefill
     clock.set(110.0)
-    scheduler.postprocess(decode_seqs, token_ids=[99], is_prefill=is_prefill)
+    scheduler.postprocess(decode_seqs_output, token_ids=[99])
 
     metrics = stats.requests[seq.seq_id]
     assert seq.status is SequenceStatus.FINISHED
@@ -244,8 +258,10 @@ def test_scheduler_without_stats_keeps_original_behavior(
     )
     scheduler.add(seq)
 
-    scheduled_seqs, is_prefill = schedule_legacy(scheduler)
-    scheduler.postprocess(scheduled_seqs, token_ids=[90], is_prefill=is_prefill)
+    scheduled_seqs_output = schedule_legacy(scheduler)
+    scheduled_seqs = scheduled_seqs_output.scheduled_seqs
+    is_prefill = scheduled_seqs_output.is_prefill
+    scheduler.postprocess(scheduled_seqs_output, token_ids=[90])
 
     assert scheduler.stats is None
     assert seq.completion_token_ids == [90]
