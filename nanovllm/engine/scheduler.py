@@ -77,18 +77,62 @@ class Scheduler:
         raise RuntimeError("Scheduler 没有可调度的请求")
 
     def _schedule_unified(self) -> UnifiedSchedulerOutput:
+        # scheduled_seqs[i], is_prefilling[i], should_sample[i] 三者按位置一一对应
         scheduled_seqs: list[Sequence] = []
         # 用来表征某个 Sequence 是在 prefill 还是在 decode
         is_prefilling: list[bool] = []
         # 用来区分某个 Sequence 是否需要采样出新 token
-        sampling_indices: list[bool] = []
-        token_budget = self.max_num_batched_tokens
+        should_sample: list[bool] = []
 
+        token_budget = self.max_num_batched_tokens
+        # 构造本轮两种请求的快照
+        running_seqs = list(self.running)
+        waiting_seqs = list(self.waiting)
+        
+        preemption_happened: bool = False
 
         # 先处理 running 请求
+        for seq in running_seqs:
+            if seq.status is not SequenceStatus.RUNNING:
+                continue
+
+            if len(scheduled_seqs) >= self.max_num_seqs:
+                break
+
+            if token_budget == 0:
+                break
+
+            while not self.block_manager.can_append(seq):
+                if self.running:
+                    victim = self.running.pop()
+                else:
+                    victim = seq
+
+                self.preempt(victim)
+                preemption_happened = True
+
+                if victim is seq:
+                    break
+
+            # 防止抢占之后继续执行后续 decode 逻辑
+            if seq.status is not SequenceStatus.RUNNING:
+                continue
+
+            num_new_tokens = seq.num_tokens - seq.num_cached_tokens
+            num_new_tokens = min(num_new_tokens, token_budget)
 
 
         # 再处理 waiting 请求
+        if not preemption_happened:
+            for seq in waiting_seqs:
+                if seq.status is not SequenceStatus.WAITING:
+                    continue
+
+                if len(scheduled_seqs) >= self.max_num_seqs:
+                    break
+
+                if token_budget == 0:
+                    break
 
 
         raise NotImplementedError("Unified Scheduler 尚未实现")

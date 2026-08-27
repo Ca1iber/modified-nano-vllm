@@ -120,7 +120,12 @@ class BlockManager:
 
     # decode 的当前 token 若位于新逻辑 block 的开头，则检查是否至少还有一个空闲物理 block。
     def can_append(self, seq: Sequence) -> bool:
-        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)    # 后面这段判断 > Sequence 当前最后一个 token，是不是一个新逻辑 KV block 的第一个 token
+        return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)    
+        # 后面这段判断 > Sequence 当前最后一个 token，是不是一个新逻辑 KV block 的第一个 token
+        #   need_new_block = len(seq) % self.block_size == 1
+        #   if need_new_block:
+        #       return len(self.free_block_ids) >= 1
+        #   return True        
 
     # decode 跨入新逻辑 block 时，为 Sequence 的 block_table 追加一个新物理 block id。
     def may_append(self, seq: Sequence):
