@@ -225,6 +225,63 @@ def test_allocate_slots_allocates_only_at_block_boundaries(
     assert manager.used_block_ids == set(seq.block_table)
 
 
+# 场景：Sequence 已完成前 4 个 token 的计算并持有一个物理 Block，本轮一次需要计算
+# 后续 8 个 token。验证 allocate_slots 会根据本轮结束位置一次性补齐两个物理 Block，
+# 而不是只处理一个 token 或每个 token 重复申请 Block。
+def test_allocate_slots_supports_multiple_new_tokens(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Allocating eight new tokens can add multiple physical blocks at once."""
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+
+    manager = BlockManager(num_blocks=4, block_size=block_size)
+    seq = Sequence(
+        token_ids=[10, 11, 12, 13],
+        sampling_params=SamplingParams(max_tokens=8),
+    )
+    manager.allocate(seq, num_cached_blocks=manager.can_allocate(seq))
+    seq.num_cached_tokens = 4
+
+    assert len(seq.block_table) == 1
+    assert manager._num_required_new_blocks(seq, num_new_tokens=8) == 2
+    assert manager.can_allocate_slots(seq, num_new_tokens=8) is True
+
+    manager.allocate_slots(seq, num_new_tokens=8)
+
+    assert len(seq.block_table) == 3
+    assert len(manager.used_block_ids) == 3
+    assert manager.used_block_ids == set(seq.block_table)
+
+
+# 场景：Chunked Prefill 已经为完整 Prompt 提前分配了全部物理 Block，但本轮只计算其中
+# 一小段 token。验证新增物理 Block 数量为 0，allocate_slots 不会重复分配。
+def test_allocate_slots_reuses_preallocated_chunked_prefill_blocks(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Preallocated chunked-prefill blocks are not allocated a second time."""
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+
+    manager = BlockManager(num_blocks=4, block_size=block_size)
+    seq = Sequence(
+        token_ids=[10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
+        sampling_params=SamplingParams(max_tokens=2),
+    )
+    manager.allocate(seq, num_cached_blocks=manager.can_allocate(seq))
+    initial_block_table = list(seq.block_table)
+
+    assert len(initial_block_table) == 3
+    assert seq.num_cached_tokens == 0
+    assert manager._num_required_new_blocks(seq, num_new_tokens=4) == 0
+    assert manager.can_allocate_slots(seq, num_new_tokens=4) is True
+
+    manager.allocate_slots(seq, num_new_tokens=4)
+
+    assert seq.block_table == initial_block_table
+    assert manager.used_block_ids == set(initial_block_table)
+
+
 # 场景：BlockManager 只有一个物理 Block，但 6-token 请求需要两个逻辑 Block。
 # 验证 can_allocate 返回 -1 表示容量不足，并且检查过程本身不做部分分配，
 # Sequence 和 BlockManager 的 block_table、used/free 集合、ref_count 均保持原状。
