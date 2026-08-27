@@ -119,7 +119,8 @@ class BlockManager:
         seq.block_table.clear()
 
     # decode 的当前 token 若位于新逻辑 block 的开头，则检查是否至少还有一个空闲物理 block。
-    def can_append(self, seq: Sequence) -> bool:
+    # 新增 num_new_tokens 且默认为 1 以兼容 Legacy
+    def can_append(self, seq: Sequence, num_new_tokens: int = 1) -> bool:
         return len(self.free_block_ids) >= (len(seq) % self.block_size == 1)    
         # 后面这段判断 > Sequence 当前最后一个 token，是不是一个新逻辑 KV block 的第一个 token
         #   need_new_block = len(seq) % self.block_size == 1
@@ -128,7 +129,8 @@ class BlockManager:
         #   return True        
 
     # decode 跨入新逻辑 block 时，为 Sequence 的 block_table 追加一个新物理 block id。
-    def may_append(self, seq: Sequence):
+    # 新增 num_new_tokens 且默认为 1 以兼容 Legacy
+    def may_append(self, seq: Sequence, num_new_tokens: int = 1):
         if len(seq) % self.block_size == 1:
             seq.block_table.append(self._allocate_block())
 
@@ -145,3 +147,18 @@ class BlockManager:
             h = self.compute_hash(token_ids, h)
             block.update(h, token_ids)
             self.hash_to_block_id[h] = block.block_id
+
+    # 本轮结束位置所需要覆盖的总逻辑 block 数
+    def _num_all_blocks(self, seq: Sequence, num_new_tokens: int) -> int:
+        end_token = seq.num_cached_tokens + num_new_tokens
+        return (end_token - 1 + self.block_size) // self.block_size
+
+    # 计算本轮新覆盖的逻辑 block 数
+    def _num_new_logical_blocks(self, seq: Sequence, num_new_tokens: int) -> int:
+        num_current_blocks = (
+            seq.num_cached_tokens - 1 + self.block_size) // self.block_size
+        return self._num_all_blocks(seq, num_new_tokens) - num_current_blocks
+
+    # 计算本轮需要新增的物理 block 数
+    def _num_required_new_blocks(self, seq: Sequence, num_new_tokens: int) -> int:
+        return max(self._num_all_blocks(seq, num_new_tokens) - len(seq.block_table), 0)
