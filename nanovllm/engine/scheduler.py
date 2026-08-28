@@ -367,6 +367,37 @@ class Scheduler:
 
 
     def _postprocess_unified(self, scheduler_output: UnifiedSchedulerOutput, token_ids: list[int]):
-        raise NotImplementedError(
-            '_postprocess_unified 尚未实现'
-        )
+        for seq, token_id, is_prefilling, should_sample in zip(
+            scheduler_output.scheduled_seqs,
+            token_ids,
+            scheduler_output.is_prefilling,
+            scheduler_output.should_sample,
+            strict=True
+        ):
+            self.block_manager.hash_blocks(seq)
+
+            seq.num_cached_tokens += seq.num_scheduled_tokens
+            seq.num_scheduled_tokens = 0
+
+            if not should_sample:
+                continue
+
+            seq.append_token(token_id)
+
+            # 最后一个 prefill chunk 需要将 is_prefill 改为 false
+            if is_prefilling and should_sample:
+                seq.is_prefill = False
+
+            finished = (
+                (not seq.ignore_eos and token_id == self.eos)
+                or seq.num_completion_tokens == seq.max_tokens
+            )
+            if finished:
+                seq.status = SequenceStatus.FINISHED
+
+            if self.stats is not None:
+                self.stats.record_output_token(seq.seq_id, finished=finished)
+
+            if finished:
+                self.block_manager.deallocate(seq)
+                self.running.remove(seq)
