@@ -122,6 +122,170 @@ def test_unified_chunked_prefill_enters_running(
     assert len(seq.block_table) == 2
 
 
+def test_unified_schedules_prefill_and_decode_from_running(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Running prefill and decode requests share one token budget."""
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    scheduler = Scheduler(
+        make_scheduler_config(
+            scheduler_mode="unified",
+            max_num_seqs=2,
+            max_num_batched_tokens=3,
+            kvcache_block_size=block_size,
+            num_kvcache_blocks=4,
+        )
+    )
+
+    decode_seq = Sequence(
+        token_ids=[10, 11, 12, 13],
+        sampling_params=SamplingParams(max_tokens=3),
+    )
+    scheduler.block_manager.allocate(decode_seq, num_cached_blocks=0)
+    decode_seq.num_cached_tokens = 4
+    decode_seq.append_token(90)
+    decode_seq.status = SequenceStatus.RUNNING
+    decode_seq.is_prefill = False
+
+    prefill_seq = Sequence(
+        token_ids=[20, 21, 22, 23, 24, 25, 26, 27],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    scheduler.block_manager.allocate(prefill_seq, num_cached_blocks=0)
+    prefill_seq.num_cached_tokens = 4
+    prefill_seq.status = SequenceStatus.RUNNING
+    prefill_seq.is_prefill = True
+
+    scheduler.running.extend([decode_seq, prefill_seq])
+
+    output = schedule_unified(scheduler)
+
+    assert output.scheduled_seqs == [decode_seq, prefill_seq]
+    assert output.total_num_scheduled_tokens == 3
+    assert decode_seq.num_scheduled_tokens == 1
+    assert prefill_seq.num_scheduled_tokens == 2
+    assert output.is_prefilling == [False, True]
+    assert output.should_sample == [True, False]
+    assert decode_seq.num_cached_tokens == 4
+    assert prefill_seq.num_cached_tokens == 4
+    assert list(scheduler.waiting) == []
+    assert list(scheduler.running) == [decode_seq, prefill_seq]
+
+
+def test_unified_final_prefill_chunk_samples_and_switches_to_decode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """The final prefill chunk accepts one token and enters decode mode."""
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    scheduler = Scheduler(
+        make_scheduler_config(
+            scheduler_mode="unified",
+            max_num_batched_tokens=4,
+            kvcache_block_size=block_size,
+        )
+    )
+    seq = Sequence(
+        token_ids=[10, 11, 12, 13, 14, 15],
+        sampling_params=SamplingParams(max_tokens=2),
+    )
+    scheduler.add(seq)
+
+    first_output = schedule_unified(scheduler)
+
+    assert first_output.scheduled_seqs == [seq]
+    assert first_output.is_prefilling == [True]
+    assert first_output.should_sample == [False]
+    scheduler.postprocess(first_output, token_ids=[90])
+
+    assert seq.num_cached_tokens == 4
+    assert seq.num_scheduled_tokens == 0
+    assert seq.num_tokens == 6
+    assert seq.completion_token_ids == []
+    assert seq.status is SequenceStatus.RUNNING
+    assert seq.is_prefill is True
+
+    second_output = schedule_unified(scheduler)
+
+    assert second_output.scheduled_seqs == [seq]
+    assert second_output.total_num_scheduled_tokens == 2
+    assert second_output.is_prefilling == [True]
+    assert second_output.should_sample == [True]
+    scheduler.postprocess(second_output, token_ids=[91])
+
+    assert seq.num_cached_tokens == 6
+    assert seq.num_scheduled_tokens == 0
+    assert seq.num_tokens == 7
+    assert seq.completion_token_ids == [91]
+    assert seq.status is SequenceStatus.RUNNING
+    assert seq.is_prefill is False
+    assert list(scheduler.waiting) == []
+    assert list(scheduler.running) == [seq]
+
+
+def test_unified_preemption_skips_waiting_and_prioritizes_victim(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A preempted running request stays ahead of an existing waiter."""
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    scheduler = Scheduler(
+        make_scheduler_config(
+            scheduler_mode="unified",
+            max_num_seqs=3,
+            max_num_batched_tokens=4,
+            kvcache_block_size=block_size,
+            num_kvcache_blocks=3,
+        )
+    )
+    seq_a = Sequence(
+        token_ids=[10, 11, 12, 13],
+        sampling_params=SamplingParams(max_tokens=3),
+    )
+    seq_b = Sequence(
+        token_ids=[20, 21, 22, 23, 24, 25, 26, 27],
+        sampling_params=SamplingParams(max_tokens=3),
+    )
+    seq_c = Sequence(
+        token_ids=[30, 31, 32, 33],
+        sampling_params=SamplingParams(max_tokens=3),
+    )
+
+    scheduler.block_manager.allocate(seq_a, num_cached_blocks=0)
+    seq_a.num_cached_tokens = 4
+    seq_a.append_token(90)
+    seq_a.status = SequenceStatus.RUNNING
+    seq_a.is_prefill = False
+
+    scheduler.block_manager.allocate(seq_b, num_cached_blocks=0)
+    seq_b.num_cached_tokens = 8
+    seq_b.append_token(91)
+    seq_b.status = SequenceStatus.RUNNING
+    seq_b.is_prefill = False
+
+    scheduler.running.extend([seq_a, seq_b])
+    scheduler.waiting.append(seq_c)
+    assert len(scheduler.block_manager.free_block_ids) == 0
+
+    output = schedule_unified(scheduler)
+
+    assert output.scheduled_seqs == [seq_a]
+    assert output.total_num_scheduled_tokens == 1
+    assert output.is_prefilling == [False]
+    assert output.should_sample == [True]
+    assert list(scheduler.running) == [seq_a]
+    assert list(scheduler.waiting) == [seq_b, seq_c]
+    assert seq_b.status is SequenceStatus.WAITING
+    assert seq_b.is_prefill is True
+    assert seq_b.num_cached_tokens == 0
+    assert seq_b.block_table == []
+    assert seq_c.status is SequenceStatus.WAITING
+    assert seq_c.num_scheduled_tokens == 0
+    assert seq_c.block_table == []
+    assert len(scheduler.block_manager.free_block_ids) == 1
+
+
 # 场景：6-token prompt 遇到 4-token budget，第一轮只能 Prefill 前 4 个 token。
 # 验证请求仍留在 waiting，postprocess 只推进 cached_tokens、不记录临时采样 token；
 # 同时检查 Scheduler 为完整 prompt 预留的两个 KV Block 及其引用计数。
