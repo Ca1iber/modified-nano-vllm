@@ -9,6 +9,9 @@
 - 最新已完成检查点：P1.2c 按请求更新状态与采样边界。Unified Scheduler 已按每个
   Sequence 的实际计算区间推进缓存状态、判断采样边界，并通过 EOS/ignore_eos、
   Legacy/Unified 等价状态和 KV 资源释放回归；核心实现检查点为 `4525b78`。
+- 下一检查点：P1.2d 建立 Unified-first 执行契约。继续保留差异化的
+  `LegacySchedulerOutput` 与 `UnifiedSchedulerOutput`，但在 Scheduler/ModelRunner
+  边界将 Legacy 输出适配为 Unified 输出，使 ModelRunner 最终只维护 Unified 协议。
 - 已完成 P0.3a RequestMetrics、P0.3b StepMetrics、P0.3c
   preemption/recompute 与 KV Cache 指标，以及 P0.3d 百分位汇总和 benchmark
   报告接口。
@@ -649,19 +652,65 @@ Sequence 本轮的计算区间判断：
 - 定向验证：新增 3 个测试实例全部通过；全量命令
   `conda run -n nano-vllm bash tests/run.sh all -q`，结果为
   `112 passed, 14 skipped`；`git diff --check` 通过。
-- 范围边界：P1.2c 只闭合 Scheduler 的逐请求状态和采样语义；Engine 对 Unified 输出的
-  消费、全局 `is_prefill` 兼容字段收敛属于 P1.2d，混合 metadata 属于 P1.3。
+- 范围边界：P1.2c 只闭合 Scheduler 的逐请求状态和采样语义；Unified 执行契约与
+  Legacy Output 适配属于 P1.2d，混合 metadata 属于 P1.3。
 
-#### `[ ]` P1.2d 兼容层与旧字段收敛
+#### `[ ]` P1.2d Unified 执行契约与 Legacy Output 适配
 
-在 SchedulerOutput 和 per-request 状态稳定后，再逐步移除：
+保留两种差异化 Scheduler 输出：
 
-- `Scheduler.schedule()` 返回值中的全局 `is_prefill`；
-- `LLMEngine.step()` 中按全局 phase 统计 token 的逻辑；
-- `Sequence.is_prefill` 作为持久化状态的用途。
+- `LegacySchedulerOutput` 保留全局 `is_prefill`，用于描述旧同质 Batch 调度结果；
+- `UnifiedSchedulerOutput` 保留逐请求 `is_prefilling` 与 `should_sample`，用于描述统一
+  Token-level 调度结果。
 
-这一小项只负责收敛接口，不实现 Attention 混合执行。完成后，P1.3 才开始改
-ModelRunner metadata。
+二者通过 `SchedulerOutput.to_unified()`（名称可在实现时微调）向 ModelRunner 暴露
+统一接口：
+
+- `UnifiedSchedulerOutput.to_unified()` 返回自身；
+- `LegacySchedulerOutput.to_unified()` 创建共享相同 Sequence 引用的 Unified 适配对象；
+- Legacy 的 `is_prefilling` 由全局 `is_prefill` 展开为逐请求列表；
+- Legacy 的 `should_sample` 按
+  `seq.num_cached_tokens + seq.num_scheduled_tokens == seq.num_tokens` 逐请求推导；
+- 转换必须发生在模型执行和 postprocess 之前，避免 `num_cached_tokens` 已推进、
+  `num_scheduled_tokens` 已清零后丢失本轮调度快照。
+
+`LLMEngine.step()` 只负责固定的数据流，不根据具体 Output 类型分支：
+
+```text
+raw_scheduler_output = Scheduler.schedule()
+runner_output = raw_scheduler_output.to_unified()
+token_ids = ModelRunner.run(runner_output)
+Scheduler.postprocess(raw_scheduler_output, token_ids)
+```
+
+兼容方向由“Legacy ModelRunner 为主、Unified 调度向旧接口妥协”调整为“Unified 执行契约
+为主、Legacy Output 在边界适配”。P1.2d 只建立契约和兼容边界，不宣称 ModelRunner
+已经支持混合 Batch。在 `prepare_unified()` 完成前，ModelRunner 可以从
+`UnifiedSchedulerOutput.is_prefilling` 暂时恢复一个仅供旧执行路径使用的同质 phase：
+
+- 全为 `True` 时继续调用现有 `prepare_prefill()`；
+- 全为 `False` 时继续调用现有 `prepare_decode()`；
+- 同时包含 `True/False` 时不得误选其中一条旧路径；P1.3 的 `prepare_unified()` 先让
+  Mixed 输入能够构造 metadata，完整 Mixed forward 则继续 fail closed，直到 P1.4
+  改造 Attention 后再移除限制。P1.4 前，Mixed 只允许在 Scheduler 和 metadata 单测中
+  验证；若真实 Engine 已提交调度状态后遇到该限制，必须将其视为终止性错误，不得捕获后
+  继续复用当前 Engine。该迁移不形成永久的 Legacy/Unified 双 ModelRunner。
+
+上述 phase 只允许存在于 ModelRunner 的迁移实现内部；`LLMEngine.step()` 仍只传递
+`runner_output`，不读取 `LegacySchedulerOutput.is_prefill`，也不感知适配前的输出类型。
+
+验收：
+
+- Legacy Partial Prefill、最终 Prefill chunk 和 Decode 转换后的 `is_prefilling`、
+  `should_sample` 与 Unified 状态语义一致；
+- Prefix Cache 命中与抢占重算后的 `should_sample` 仍由 token 追赶关系正确推导；
+- Unified 输出转换保持对象身份不变，Legacy 转换不修改原输出或 Sequence 状态；
+- `LLMEngine.step()` 不读取 `LegacySchedulerOutput.is_prefill`，也不按 Output 类型分支；
+- 纯 Prefill/纯 Decode 的 Legacy 输出经适配后仍能复用当前 ModelRunner，Mixed 输出在
+  `prepare_unified()` 完成前必须 fail closed，不能按错误 phase 执行；
+- Legacy 三种 P1.1 策略的最终 token、状态、KV Block 与现有基线一致；
+- 全量 CPU 测试与现有 GPU 生成正确性回归通过；GPU 不可用时必须明确 skip，不能静默
+  省略。`git diff --check` 通过。
 
 P1.2 总体验收：
 
@@ -674,32 +723,73 @@ P1.2 总体验收：
 
 ### `[ ]` P1.3 混合 Batch Metadata
 
-目标：让 ModelRunner 和 Attention 接收每请求不同的 query length，而不是依赖全局
-`is_prefill` 在 `prepare_prefill` 与 `prepare_decode` 之间二选一。
+目标：让 ModelRunner 以 `UnifiedSchedulerOutput` 为规范输入，接收每请求不同的 query
+length，而不是依赖全局 `is_prefill` 在 `prepare_prefill` 与 `prepare_decode` 之间二选一。
+Legacy 输出只通过 P1.2d 的适配器进入这条统一 metadata 路径，ModelRunner 不直接识别
+`LegacySchedulerOutput`。
+
+实现一个统一的 `prepare_unified()`（最终名称可微调），而不是长期并列维护
+`prepare_prefill()`、`prepare_decode()` 和只处理混合请求的 `prepare_mix()`。该入口应同时
+覆盖纯 Prefill、纯 Decode 与 Mixed Batch；旧的两个 prepare 方法可以在迁移期间作为
+实现参考或兼容 helper，待统一路径通过正确性验证后再收敛。
 
 需要统一表达：
 
 - `num_scheduled_tokens`：每个请求本轮计算的 token 数。
 - `query_start_loc` 或等价的 ragged batch 边界。
 - 每个请求的 `num_computed_tokens`、context length、block table 和 slot mapping。
-- 哪些 query 行仍处于 Prefill，哪些 query 行属于 Decode。
+- `sample_indices` 或等价信息：只从 `should_sample=True` 的请求位置获取有效输出。
+- 哪些 query 行仍处于 Prefill，哪些 query 行属于 Decode；该信息用于构造 metadata，
+  不再恢复成整个 Step 共用的 phase。
+
+对扁平 query，`query_start_loc` 由每请求 `num_scheduled_tokens` 的前缀和构造。例如：
+
+```text
+num_scheduled_tokens = [1, 3, 2]
+query_start_loc       = [0, 1, 4, 6]
+should_sample         = [True, False, True]
+sample_indices        = [0, 5]
+```
+
+`sample_indices` 是紧凑列表，指向每个需要采样请求的最后一个 query 行，其长度等于
+`should_sample=True` 的请求数。ModelRunner 的采样结果必须保留与 `scheduled_seqs` 的明确
+对应关系：若返回按请求对齐的 `sampled_token_ids`，则其长度与请求数一致，
+`should_sample=False` 的位置使用 `None`；也可以返回紧凑 token 列表并附带对应的 `seq_id`
+或采用等价的 `seq_id -> token_id` 映射。无论采用哪种表示，postprocess 都必须推进所有
+已执行请求的 `num_cached_tokens`，不能因为某个请求本轮不采样而跳过它的计算进度更新。
 
 验收：
 
 - 纯 Prefill 和纯 Decode 继续通过现有正确性测试。
 - 至少覆盖一个 Decode 请求与一个 Chunked Prefill 请求同一 Step 的 metadata 构造。
+- Legacy 输出经适配后与等价 Unified 输出生成相同的 input token、position、query 边界、
+  slot mapping、block table 和采样位置。
+- `prepare_unified()` 对纯 Prefill、纯 Decode 和 Mixed 输入使用同一份 per-request 计数
+  语义；Mixed metadata 构造不再依赖同质 phase，但完整模型执行在 P1.4 前仍保持
+  fail closed。
+- `should_sample=False` 的请求不产生有效输出 token，但其本轮 cached token 进度仍正确提交。
 - 跨 block slot、Prefix Cache 和请求完成后的 ref_count 均正确。
 - 不以两个独立的 Engine step 冒充一个混合 Scheduler step。
 
 ### `[ ]` P1.4 混合 Prefill/Decode 执行
 
-目标：在 P1.3 metadata 稳定后，使同一 ModelRunner Step 能处理混合请求；Attention
-backend 可以先在同一 forward 中区分 decode 行和 prefill 行，再决定是否融合 kernel。
+目标：在 P1.3 metadata 稳定后，使 Unified ModelRunner 在同一 Step 中处理混合请求；
+移除“`is_prefilling` 必须全部相同”的临时限制。Attention backend 可以先在同一
+forward 中区分 Decode 行和 Prefill 行，再决定是否融合 kernel。
+
+`prepare_unified()` 只负责构造输入和 metadata，不等于已经支持混合执行。当前
+Attention 仍通过全局 `Context.is_prefill` 在 Prefill FlashAttention 与 Decode Paged
+Attention 之间二选一；本阶段需要让 Attention 消费逐请求/逐 query metadata，并保证
+两类 query 在同一 forward 中使用各自正确的 causal 和 KV Cache 语义。
 
 验收：
 
 - 同一 Scheduler Step 同时包含 Decode 和 Chunked Prefill。
 - Decode 行和 Prefill 行分别使用正确的 causal、context length、KV block 和 slot 语义。
+- ModelRunner 的主执行入口只消费 Unified 协议；Legacy 调度结果通过 P1.2d 适配进入，
+  不保留永久的 `_run_legacy()`/`_run_unified()` 双协议分发。
+- `StepMetrics` 和 `LLMEngine.step()` 的返回统计能够表达同一轮中的 Prefill/Decode token
+  组成，不再依赖单个 `is_prefill` 布尔值或“正数代表 Prefill、负数代表 Decode”的约定。
 - 与 P1.1 分阶段执行比较 TTFT、ITL、吞吐、GPU 空洞和 metadata 开销。
 - 明确区分“同一调度/forward step”和“同一个 Attention kernel launch”，不将两者混为一谈。
 
