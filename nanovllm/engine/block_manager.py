@@ -68,28 +68,70 @@ class BlockManager:
         self.used_block_ids.remove(block_id)
         self.free_block_ids.append(block_id)
 
-    # 检查 Sequence 的完整前缀命中了多少缓存 block，并判断剩余物理 block 是否足够。
-    # 返回命中的完整 block 数；若容量不足则返回 -1。
-    def can_allocate(self, seq: Sequence) -> int:
+    # 计算当前序列 Prefix Cache 命中了多少个 blocks
+    # 解决原 can_allocate 中可能出现的分配冗余问题：默认为整个 prompt
+    # 计算所需 block 数，但是实际上有可能因为 budget 原因没法分配那么多
+    # 会导致浪费
+    def get_num_cached_blocks(self, seq: Sequence) -> int:
         h = -1
         num_cached_blocks = 0
-        num_new_blocks = seq.num_blocks
+
+        # 最后一个逻辑 block 不参与命中，保证至少重新计算最后部分以获得 logits
         for i in range(seq.num_blocks - 1):
             token_ids = seq.block(i)
             h = self.compute_hash(token_ids, h)
+
             block_id = self.hash_to_block_id.get(h, -1)
-            if block_id == -1 or self.blocks[block_id].token_ids != token_ids:
+            if block_id == -1:
                 break
+
+            block = self.blocks[block_id]
+            if block.token_ids != token_ids:
+                break
+
             num_cached_blocks += 1
-            if block_id in self.used_block_ids:
-                num_new_blocks -= 1
-        if len(self.free_block_ids) < num_new_blocks:
-            return -1
+
         return num_cached_blocks
 
+    # 判断剩余物理 block 是否足够 num_new_tokens
+    def can_allocate(self, seq: Sequence, num_new_tokens: int | None = None) -> bool:
+        num_cached_blocks = self.get_num_cached_blocks(seq)
+
+        # legacy 检查完整 Sequence
+        if num_new_tokens is None:
+            end_token = seq.num_tokens
+        else:
+            end_token = num_cached_blocks * self.block_size + num_new_tokens
+
+        num_required_blocks = (end_token - 1 + self.block_size) // self.block_size
+        num_required_free_blocks = num_required_blocks
+        # 重新沿 Prefix hash 遍历已经命中的 blocks
+        h = -1
+        for i in range(num_cached_blocks):
+            token_ids = seq.block(i)
+            h = self.compute_hash(token_ids, h)
+            block_id = self.hash_to_block_id.get(h, -1)
+
+            if block_id in self.used_block_ids:
+                num_required_free_blocks -= 1
+
+        if len(self.free_block_ids) < num_required_free_blocks:
+            return False
+
+        return True
+
     # 为新 Sequence 填充 block_table：先复用命中的 prefix blocks，再分配未命中的 blocks。
-    def allocate(self, seq: Sequence, num_cached_blocks: int):
+    def allocate(self, seq: Sequence, num_new_tokens: int | None = None):
         assert not seq.block_table
+
+        num_cached_blocks = self.get_num_cached_blocks(seq)
+
+        if num_new_tokens is None:
+            num_required_blocks = seq.num_blocks
+        else:
+            end_token = num_cached_blocks * self.block_size + num_new_tokens
+            num_required_blocks = (end_token - 1 + self.block_size) // self.block_size
+
         h = -1
         for i in range(num_cached_blocks):
             token_ids = seq.block(i)            # 取出第 i 个 cached_block 的 tokens
@@ -103,7 +145,7 @@ class BlockManager:
                 self.free_block_ids.remove(block_id)
                 self.used_block_ids.add(block_id)
             seq.block_table.append(block_id)
-        for i in range(num_cached_blocks, seq.num_blocks):
+        for _ in range(num_cached_blocks, num_required_blocks):
             seq.block_table.append(self._allocate_block())
         seq.num_cached_tokens = num_cached_blocks * self.block_size
 

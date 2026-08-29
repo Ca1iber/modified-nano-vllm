@@ -154,23 +154,36 @@ class Scheduler:
                 # block_table 为空
                 # -> 新请求或被抢占后重算
                 # -> 需要 Prefix Cache 查询和首次分配
-                if not seq.block_table:
-                    num_cached_blocks = self.block_manager.can_allocate(seq)
-
-                    if num_cached_blocks == -1:
-                        break
-
-                    self.block_manager.allocate(seq, num_cached_blocks)
-
                 # block_table 非空
                 # -> 上一轮 chunked prefill 尚未完成
                 # -> 继续使用已有 block_table
                 # 或已经分配完, 直接接着用
-                num_new_tokens = seq.num_tokens - seq.num_cached_tokens
-                num_new_tokens = min(num_new_tokens, token_budget)
+                # 1. block_table 为空，尚未计算过 cache 命中数，因此需要计算一次确定当前 num_cached_tokens
+                if not seq.block_table:
+                    num_cached_blocks = self.block_manager.get_num_cached_blocks(seq)
+                    num_cached_tokens = num_cached_blocks * self.block_size
+                # 2. 不为空，有 num_cached_tokens 了，可能正在 decode 但是被抢占回到 waiting 了，所以 num_cache_tokens 不一定是 block_size 的整数倍了
+                else:
+                    num_cached_tokens = seq.num_cached_tokens
+
+                num_new_tokens = min(
+                    seq.num_tokens - num_cached_tokens,
+                    token_budget
+                )
 
                 if num_new_tokens == 0:
+                    # 解决队伍阻塞问题，但还是没解决饥饿的问题 MARK
                     continue
+
+                if not seq.block_table:
+                    if not self.block_manager.can_allocate(seq, num_new_tokens):
+                        continue
+                    self.block_manager.allocate(seq, num_new_tokens)
+
+                else:
+                    if not self.block_manager.can_allocate_slots(seq, num_new_tokens):
+                        continue
+                    self.block_manager.allocate_slots(seq, num_new_tokens)
 
                 seq.num_scheduled_tokens = num_new_tokens
                 scheduled_seqs.append(seq)
@@ -234,8 +247,8 @@ class Scheduler:
             if remaining == 0:
                 break
             if not seq.block_table:
-                num_cached_blocks = self.block_manager.can_allocate(seq)
-                if num_cached_blocks == -1:
+                num_cached_blocks = self.block_manager.get_num_cached_blocks(seq)
+                if not self.block_manager.can_allocate(seq):
                     break
                 num_tokens = seq.num_tokens - num_cached_blocks * self.block_size
             else:   # block_table 不为空，上次 chunked prefill 没做完走的分支
@@ -243,7 +256,7 @@ class Scheduler:
             if remaining < num_tokens and scheduled_seqs:  # only allow chunked prefill for the first seq
                 break
             if not seq.block_table:
-                self.block_manager.allocate(seq, num_cached_blocks)
+                self.block_manager.allocate(seq)
                 if self.stats is not None:
                     self.stats.record_prefix_cache_hit(
                         seq.seq_id,

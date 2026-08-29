@@ -23,12 +23,13 @@ def test_allocate_and_deallocate_updates_block_state(
     )
 
     assert seq.num_blocks == 2
-    assert manager.can_allocate(seq) == 0
+    assert manager.get_num_cached_blocks(seq) == 0
+    assert manager.can_allocate(seq) is True
     assert seq.block_table == []
     assert manager.used_block_ids == set()
     assert set(manager.free_block_ids) == set(range(num_blocks))
 
-    manager.allocate(seq, num_cached_blocks=0)
+    manager.allocate(seq)
 
     allocated_block_ids = list(seq.block_table)
     assert len(allocated_block_ids) == 2
@@ -74,7 +75,8 @@ def test_prefix_hit_shares_block_and_releases_on_last_reference(
         token_ids=[10, 11, 12, 13, 20, 21],
         sampling_params=SamplingParams(max_tokens=2),
     )
-    manager.allocate(seq1, num_cached_blocks=manager.can_allocate(seq1))
+    assert manager.can_allocate(seq1) is True
+    manager.allocate(seq1)
 
     # 模拟一次完整 Prefill：先登记新完成的完整 Block，再提交 cached_tokens 进度。
     seq1.num_scheduled_tokens = 6
@@ -92,10 +94,11 @@ def test_prefix_hit_shares_block_and_releases_on_last_reference(
         token_ids=[10, 11, 12, 13, 30, 31],
         sampling_params=SamplingParams(max_tokens=2),
     )
-    num_cached_blocks = manager.can_allocate(seq2)
+    num_cached_blocks = manager.get_num_cached_blocks(seq2)
 
     assert num_cached_blocks == 1
-    manager.allocate(seq2, num_cached_blocks=num_cached_blocks)
+    assert manager.can_allocate(seq2) is True
+    manager.allocate(seq2)
 
     assert seq2.num_cached_tokens == block_size
     # 两个 Sequence 的第一个逻辑 Block 指向同一个物理 Prefix Block。
@@ -140,7 +143,8 @@ def test_reallocating_cached_block_invalidates_old_hash(
         token_ids=[10, 11, 12, 13, 20, 21],
         sampling_params=SamplingParams(max_tokens=2),
     )
-    manager.allocate(old_seq, num_cached_blocks=manager.can_allocate(old_seq))
+    assert manager.can_allocate(old_seq) is True
+    manager.allocate(old_seq)
 
     old_seq.num_scheduled_tokens = 6
     manager.hash_blocks(old_seq)
@@ -163,8 +167,9 @@ def test_reallocating_cached_block_invalidates_old_hash(
         token_ids=[30, 31, 32, 33, 40, 41],
         sampling_params=SamplingParams(max_tokens=2),
     )
-    assert manager.can_allocate(new_seq) == 0
-    manager.allocate(new_seq, num_cached_blocks=0)
+    assert manager.get_num_cached_blocks(new_seq) == 0
+    assert manager.can_allocate(new_seq) is True
+    manager.allocate(new_seq)
 
     # 两个 Block 都被新请求占用，旧 Prefix 所在物理 Block 必然已被重新分配。
     assert old_prefix_block_id in new_seq.block_table
@@ -189,7 +194,8 @@ def test_allocate_slots_allocates_only_at_block_boundaries(
         token_ids=[10, 11, 12, 13],
         sampling_params=SamplingParams(max_tokens=8),
     )
-    manager.allocate(seq, num_cached_blocks=manager.can_allocate(seq))
+    assert manager.can_allocate(seq) is True
+    manager.allocate(seq)
     assert len(seq.block_table) == 1
 
     # 模拟完整 Prefill 已经写入 4 个 KV token；随后追加首个生成 token。
@@ -240,7 +246,8 @@ def test_allocate_slots_supports_multiple_new_tokens(
         token_ids=[10, 11, 12, 13],
         sampling_params=SamplingParams(max_tokens=8),
     )
-    manager.allocate(seq, num_cached_blocks=manager.can_allocate(seq))
+    assert manager.can_allocate(seq) is True
+    manager.allocate(seq)
     seq.num_cached_tokens = 4
 
     assert len(seq.block_table) == 1
@@ -268,7 +275,8 @@ def test_allocate_slots_reuses_preallocated_chunked_prefill_blocks(
         token_ids=[10, 11, 12, 13, 14, 15, 16, 17, 18, 19],
         sampling_params=SamplingParams(max_tokens=2),
     )
-    manager.allocate(seq, num_cached_blocks=manager.can_allocate(seq))
+    assert manager.can_allocate(seq) is True
+    manager.allocate(seq)
     initial_block_table = list(seq.block_table)
 
     assert len(initial_block_table) == 3
@@ -283,9 +291,9 @@ def test_allocate_slots_reuses_preallocated_chunked_prefill_blocks(
 
 
 # 场景：BlockManager 只有一个物理 Block，但 6-token 请求需要两个逻辑 Block。
-# 验证 can_allocate 返回 -1 表示容量不足，并且检查过程本身不做部分分配，
+# 验证 can_allocate 返回 False 表示容量不足，并且检查过程本身不做部分分配，
 # Sequence 和 BlockManager 的 block_table、used/free 集合、ref_count 均保持原状。
-def test_can_allocate_returns_minus_one_without_changing_state(
+def test_can_allocate_returns_false_without_changing_state(
     monkeypatch: pytest.MonkeyPatch,
 ):
     """An allocation capacity check fails without mutating block state."""
@@ -299,7 +307,8 @@ def test_can_allocate_returns_minus_one_without_changing_state(
     )
 
     assert seq.num_blocks == 2
-    assert manager.can_allocate(seq) == -1
+    assert manager.get_num_cached_blocks(seq) == 0
+    assert manager.can_allocate(seq) is False
     # 容量检查失败后，请求不能得到任何部分分配的物理 Block。
     assert seq.block_table == []
     assert seq.num_cached_tokens == 0

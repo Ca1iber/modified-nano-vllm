@@ -119,7 +119,134 @@ def test_unified_chunked_prefill_enters_running(
     assert seq.is_prefill is True
     assert list(scheduler.waiting) == []
     assert list(scheduler.running) == [seq]
-    assert len(seq.block_table) == 2
+    # Unified 首次分配只覆盖本轮 4-token chunk，不提前预留完整 Prompt。
+    assert len(seq.block_table) == 1
+
+
+def test_unified_prefix_cache_hit_schedules_only_uncached_suffix(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A unified prefill resumes after a cached block and hashes its suffix."""
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    scheduler = Scheduler(
+        make_scheduler_config(
+            scheduler_mode="unified",
+            max_num_batched_tokens=4,
+            kvcache_block_size=block_size,
+            num_kvcache_blocks=4,
+        )
+    )
+
+    cached_seq = Sequence(
+        token_ids=[10, 11, 12, 13, 14],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    scheduler.block_manager.allocate(cached_seq)
+    cached_seq.num_scheduled_tokens = block_size
+    scheduler.block_manager.hash_blocks(cached_seq)
+    shared_block_id = cached_seq.block_table[0]
+    shared_block_hash = scheduler.block_manager.blocks[shared_block_id].hash
+    cached_seq.num_cached_tokens += cached_seq.num_scheduled_tokens
+    cached_seq.num_scheduled_tokens = 0
+    scheduler.block_manager.deallocate(cached_seq)
+
+    assert shared_block_hash != -1
+    assert shared_block_id in scheduler.block_manager.free_block_ids
+    assert scheduler.block_manager.hash_to_block_id[shared_block_hash] == shared_block_id
+
+    seq = Sequence(
+        token_ids=[10, 11, 12, 13, 20, 21, 22, 23],
+        sampling_params=SamplingParams(max_tokens=2),
+    )
+    scheduler.add(seq)
+
+    output = schedule_unified(scheduler)
+
+    assert output.scheduled_seqs == [seq]
+    assert output.total_num_scheduled_tokens == block_size
+    assert output.is_prefilling == [True]
+    assert output.should_sample == [True]
+    assert seq.num_cached_tokens == block_size
+    assert seq.num_scheduled_tokens == block_size
+    assert seq.block_table[0] == shared_block_id
+    assert scheduler.block_manager.blocks[shared_block_id].ref_count == 1
+
+    suffix_block_id = seq.block_table[1]
+    assert scheduler.block_manager.blocks[suffix_block_id].hash == -1
+
+    scheduler.postprocess(output, token_ids=[90])
+
+    assert seq.num_cached_tokens == 2 * block_size
+    assert seq.num_scheduled_tokens == 0
+    assert seq.completion_token_ids == [90]
+    assert seq.is_prefill is False
+    suffix_block_hash = scheduler.block_manager.blocks[suffix_block_id].hash
+    assert suffix_block_hash != -1
+    assert scheduler.block_manager.hash_to_block_id[suffix_block_hash] == suffix_block_id
+
+
+def test_unified_admits_waiting_prefill_after_running_decode(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A running decode and a new waiter share one unified token budget."""
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    scheduler = Scheduler(
+        make_scheduler_config(
+            scheduler_mode="unified",
+            max_num_seqs=2,
+            max_num_batched_tokens=3,
+            kvcache_block_size=block_size,
+            num_kvcache_blocks=4,
+        )
+    )
+
+    decode_seq = Sequence(
+        token_ids=[10, 11, 12, 13],
+        sampling_params=SamplingParams(max_tokens=3),
+    )
+    scheduler.block_manager.allocate(decode_seq)
+    decode_seq.num_cached_tokens = 4
+    decode_seq.append_token(90)
+    decode_seq.status = SequenceStatus.RUNNING
+    decode_seq.is_prefill = False
+    scheduler.running.append(decode_seq)
+
+    prefill_seq = Sequence(
+        token_ids=[20, 21, 22, 23],
+        sampling_params=SamplingParams(max_tokens=2),
+    )
+    scheduler.add(prefill_seq)
+
+    assert list(scheduler.running) == [decode_seq]
+    assert list(scheduler.waiting) == [prefill_seq]
+
+    output = schedule_unified(scheduler)
+
+    assert output.scheduled_seqs == [decode_seq, prefill_seq]
+    assert output.total_num_scheduled_tokens == 3
+    assert output.is_prefilling == [False, True]
+    assert output.should_sample == [True, False]
+    assert decode_seq.num_scheduled_tokens == 1
+    assert prefill_seq.num_scheduled_tokens == 2
+    assert list(scheduler.waiting) == []
+    assert list(scheduler.running) == [decode_seq, prefill_seq]
+    assert prefill_seq.status is SequenceStatus.RUNNING
+    assert prefill_seq.is_prefill is True
+
+    scheduler.postprocess(output, token_ids=[91, 92])
+
+    assert decode_seq.num_cached_tokens == 5
+    assert decode_seq.num_scheduled_tokens == 0
+    assert decode_seq.completion_token_ids == [90, 91]
+    assert decode_seq.is_prefill is False
+    assert prefill_seq.num_cached_tokens == 2
+    assert prefill_seq.num_scheduled_tokens == 0
+    assert prefill_seq.completion_token_ids == []
+    assert prefill_seq.is_prefill is True
+    assert list(scheduler.waiting) == []
+    assert list(scheduler.running) == [decode_seq, prefill_seq]
 
 
 def test_unified_schedules_prefill_and_decode_from_running(
@@ -142,7 +269,7 @@ def test_unified_schedules_prefill_and_decode_from_running(
         token_ids=[10, 11, 12, 13],
         sampling_params=SamplingParams(max_tokens=3),
     )
-    scheduler.block_manager.allocate(decode_seq, num_cached_blocks=0)
+    scheduler.block_manager.allocate(decode_seq)
     decode_seq.num_cached_tokens = 4
     decode_seq.append_token(90)
     decode_seq.status = SequenceStatus.RUNNING
@@ -152,7 +279,7 @@ def test_unified_schedules_prefill_and_decode_from_running(
         token_ids=[20, 21, 22, 23, 24, 25, 26, 27],
         sampling_params=SamplingParams(max_tokens=1),
     )
-    scheduler.block_manager.allocate(prefill_seq, num_cached_blocks=0)
+    scheduler.block_manager.allocate(prefill_seq)
     prefill_seq.num_cached_tokens = 4
     prefill_seq.status = SequenceStatus.RUNNING
     prefill_seq.is_prefill = True
@@ -313,13 +440,13 @@ def test_unified_preemption_skips_waiting_and_prioritizes_victim(
         sampling_params=SamplingParams(max_tokens=3),
     )
 
-    scheduler.block_manager.allocate(seq_a, num_cached_blocks=0)
+    scheduler.block_manager.allocate(seq_a)
     seq_a.num_cached_tokens = 4
     seq_a.append_token(90)
     seq_a.status = SequenceStatus.RUNNING
     seq_a.is_prefill = False
 
-    scheduler.block_manager.allocate(seq_b, num_cached_blocks=0)
+    scheduler.block_manager.allocate(seq_b)
     seq_b.num_cached_tokens = 8
     seq_b.append_token(91)
     seq_b.status = SequenceStatus.RUNNING
