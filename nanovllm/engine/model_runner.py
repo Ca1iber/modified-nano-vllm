@@ -10,7 +10,7 @@ from nanovllm.models.qwen3 import Qwen3ForCausalLM
 from nanovllm.layers.sampler import Sampler
 from nanovllm.utils.context import set_context, get_context, reset_context
 from nanovllm.utils.loader import load_model
-
+from nanovllm.engine.scheduler_output import UnifiedSchedulerOutput
 
 def resolve_num_kvcache_blocks(requested_blocks: int, available_blocks: int) -> int:
     """将 -1 解析为自动容量；显式正整数不能超过当前 GPU 的安全容量。"""
@@ -118,7 +118,17 @@ class ModelRunner:
         seqs = [Sequence([0] * seq_len) for _ in range(num_seqs)]
         for seq in seqs:
             seq.num_scheduled_tokens = seq_len
-        self.run(seqs, True)
+
+        warmup_input = UnifiedSchedulerOutput(
+            scheduled_seqs=seqs,
+            total_num_scheduled_tokens=sum(
+                seq.num_scheduled_tokens for seq in seqs
+            ),
+            is_prefilling=[True] * len(seqs),
+            should_sample=[True] * len(seqs),
+        )
+
+        self.run(warmup_input)
         torch.cuda.empty_cache()
 
     # 1. 计算 K/V Cache 可用显存    2. 计算能放多少个物理 block     3. 真正创建 GPU K/V Cache
@@ -261,7 +271,20 @@ class ModelRunner:
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     # 要改成新接口，兼容旧接口
-    def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
+    def run(self, scheduler_output: UnifiedSchedulerOutput) -> list[int] | None:
+        seqs = scheduler_output.scheduled_seqs
+        is_prefilling = scheduler_output.is_prefilling
+
+        if all(is_prefilling):
+            is_prefill = True
+        elif not any(is_prefilling):
+            is_prefill = False
+        else:
+            raise NotImplementedError(
+                "ModelRunner 暂不支持混合 Prefill/Decode batch"
+            )
+
+        # 迁移期间复用旧的同质 Prefill/Decode 执行路径
         input_ids, positions = self.prepare_prefill(seqs) if is_prefill else self.prepare_decode(seqs)
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         logits = self.run_model(input_ids, positions, is_prefill)

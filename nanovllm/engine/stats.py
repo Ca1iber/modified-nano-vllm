@@ -119,17 +119,17 @@ class RequestMetrics:
 
 
 # 一个 StepMetrics 对应一次 LLMEngine.step()，而不是对应某个 Sequence。
-# 它记录这一整轮的类型、工作量、driver 侧总耗时、缓存事件，以及
+# 它记录这一整轮的 Prefill/Decode token 组成、driver 侧总耗时、缓存事件，以及
 # postprocess 完成后的 used/free 物理 KV Block 快照。
 @dataclass(slots=True)
 class StepMetrics:
-    """一次完整 Engine Step 的类型、工作量和耗时。"""
+    """一次完整 Engine Step 的工作量组成和耗时。"""
 
     start_time: float
     end_time: float
-    is_prefill: bool
     num_seqs: int
-    num_tokens: int
+    num_prefill_tokens: int
+    num_decode_tokens: int
     num_preemptions: int = 0
     num_recomputed_tokens: int = 0
     num_prefix_hit_tokens: int = 0
@@ -140,6 +140,26 @@ class StepMetrics:
     def duration(self) -> float:
         """本轮从 schedule() 前到 postprocess() 后经过的时间。"""
         return self.end_time - self.start_time
+
+    @property
+    def num_tokens(self) -> int:
+        """本轮实际处理的 Prefill 与 Decode token 总数。"""
+        return self.num_prefill_tokens + self.num_decode_tokens
+
+    @property
+    def is_prefill_only(self) -> bool:
+        """本轮只包含 Prefill token。"""
+        return self.num_prefill_tokens > 0 and self.num_decode_tokens == 0
+
+    @property
+    def is_decode_only(self) -> bool:
+        """本轮只包含 Decode token。"""
+        return self.num_decode_tokens > 0 and self.num_prefill_tokens == 0
+
+    @property
+    def is_mixed(self) -> bool:
+        """本轮同时包含 Prefill 与 Decode token。"""
+        return self.num_prefill_tokens > 0 and self.num_decode_tokens > 0
 
     @property
     def tokens_per_second(self) -> float | None:
@@ -158,12 +178,14 @@ class EngineMetricsSummary:
     step_count: int
     prefill_step_count: int
     decode_step_count: int
+    mixed_step_count: int
     queue_wait: PercentileSummary
     ttft: PercentileSummary
     itl: PercentileSummary
     e2e_latency: PercentileSummary
     prefill_step_duration: PercentileSummary
     decode_step_duration: PercentileSummary
+    mixed_step_duration: PercentileSummary
     total_preemptions: int
     total_preempted_cached_tokens: int
     total_released_block_references: int
@@ -196,7 +218,8 @@ class EngineMetricsSummary:
                 f"Requests: {self.request_count} (completed={self.completed_request_count})",
                 (
                     f"Steps: {self.step_count} "
-                    f"(prefill={self.prefill_step_count}, decode={self.decode_step_count})"
+                    f"(prefill={self.prefill_step_count}, "
+                    f"decode={self.decode_step_count}, mixed={self.mixed_step_count})"
                 ),
                 self._format_milliseconds("Queue Wait", self.queue_wait),
                 self._format_milliseconds("TTFT", self.ttft),
@@ -204,6 +227,7 @@ class EngineMetricsSummary:
                 self._format_milliseconds("E2E", self.e2e_latency),
                 self._format_milliseconds("Prefill Step", self.prefill_step_duration),
                 self._format_milliseconds("Decode Step", self.decode_step_duration),
+                self._format_milliseconds("Mixed Step", self.mixed_step_duration),
                 f"Preemptions: {self.total_preemptions}",
                 f"Preempted cached tokens: {self.total_preempted_cached_tokens}",
                 f"Released block references: {self.total_released_block_references}",
@@ -320,9 +344,9 @@ class EngineStats:
     def record_step(
         self,
         start_time: float,
-        is_prefill: bool,
         num_seqs: int,
-        num_tokens: int,
+        num_prefill_tokens: int,
+        num_decode_tokens: int,
         used_kv_blocks: int = 0,
         free_kv_blocks: int = 0,
     ):
@@ -331,9 +355,9 @@ class EngineStats:
             StepMetrics(
                 start_time=start_time,
                 end_time=self.clock(),
-                is_prefill=is_prefill,
                 num_seqs=num_seqs,
-                num_tokens=num_tokens,
+                num_prefill_tokens=num_prefill_tokens,
+                num_decode_tokens=num_decode_tokens,
                 num_preemptions=self._step_num_preemptions,
                 num_recomputed_tokens=self._step_num_recomputed_tokens,
                 num_prefix_hit_tokens=self._step_num_prefix_hit_tokens,
@@ -362,8 +386,9 @@ class EngineStats:
             # 每对相邻输出 token 都是一条独立 ITL 样本，不能先按请求求平均。
             itl_samples.extend(metrics.itls)
 
-        prefill_steps = [step for step in self.steps if step.is_prefill]
-        decode_steps = [step for step in self.steps if not step.is_prefill]
+        prefill_steps = [step for step in self.steps if step.is_prefill_only]
+        decode_steps = [step for step in self.steps if step.is_decode_only]
+        mixed_steps = [step for step in self.steps if step.is_mixed]
 
         return EngineMetricsSummary(
             request_count=len(request_metrics),
@@ -374,6 +399,7 @@ class EngineStats:
             step_count=len(self.steps),
             prefill_step_count=len(prefill_steps),
             decode_step_count=len(decode_steps),
+            mixed_step_count=len(mixed_steps),
             queue_wait=summarize_percentiles(queue_wait_samples),
             ttft=summarize_percentiles(ttft_samples),
             itl=summarize_percentiles(itl_samples),
@@ -383,6 +409,9 @@ class EngineStats:
             ),
             decode_step_duration=summarize_percentiles(
                 step.duration for step in decode_steps
+            ),
+            mixed_step_duration=summarize_percentiles(
+                step.duration for step in mixed_steps
             ),
             total_preemptions=sum(
                 metrics.preemption_count for metrics in request_metrics

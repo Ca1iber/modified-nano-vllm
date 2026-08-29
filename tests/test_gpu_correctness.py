@@ -194,12 +194,12 @@ def test_dynamic_long_prefill_arrives_during_decode_and_releases_all_blocks():
     assert result["output_lengths"] == [64] * 4 + [16]
     assert result["old_tokens_before_arrival"] == [9] * 4
 
-    assert result["step_is_prefill"][:12] == [
-        True,
-        False, False, False, False, False, False, False, False,
-        True, True,
-        False,
-    ]
+    assert result["step_num_prefill_tokens"][:12] == (
+        [128] + [0] * 8 + [512, 512, 0]
+    )
+    assert result["step_num_decode_tokens"][:12] == (
+        [0] + [4] * 8 + [0, 0, 5]
+    )
     assert result["step_num_seqs"][:12] == [4] + [4] * 8 + [1, 1, 5]
     assert result["step_num_tokens"][:12] == [128] + [4] * 8 + [512, 512, 5]
 

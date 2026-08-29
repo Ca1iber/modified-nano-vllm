@@ -16,7 +16,11 @@ from nanovllm.engine.stats import (
     RequestMetrics,
     StepMetrics,
 )
-
+from nanovllm.engine.engine_output import (
+    EngineStepOutput,
+    FinishedRequestOutput,
+    SampledTokenOutput,
+)
 
 class LLMEngine:
 
@@ -64,42 +68,74 @@ class LLMEngine:
         return seq.seq_id
 
     # 完成一个调度、模型执行和状态更新
-    def step(self):
+    def step(self) -> EngineStepOutput:
         if self.stats is not None:
             self.stats.begin_step()
         # Step 的计时范围从 schedule() 前开始，到 postprocess() 完成后结束。
         step_start_time = self.stats.clock() if self.stats is not None else None
         # 本轮选择哪些请求
-        # 本轮被选中执行的 Sequence 列表，本轮是 prefill 还是 decode
-        scheduler_output = self.scheduler.schedule()
-        seqs, is_prefill = scheduler_output.scheduled_seqs, scheduler_output.is_prefill
-        # StepMetrics 中 token 数始终使用正数；Prefill 累加本轮各请求的 chunk，
-        # Decode 则是每个被调度请求各计算一个 token。
-        num_step_tokens = (
-            sum(seq.num_scheduled_tokens for seq in seqs)
-            if is_prefill
-            else len(seqs)
+        raw_scheduler_output = self.scheduler.schedule()
+        unified_model_runner_input = raw_scheduler_output.to_unified()
+        seqs, is_prefilling = (unified_model_runner_input.scheduled_seqs,
+                               unified_model_runner_input.is_prefilling)
+
+        # 本轮要 prefill 和 decode 的 token 数量
+        num_step_prefill_tokens = sum(
+            seq.num_scheduled_tokens
+            for seq, is_seq_prefilling in zip(
+                seqs, is_prefilling,
+                strict=True
+            )
+            if is_seq_prefilling
         )
+        num_step_decode_tokens = (
+            unified_model_runner_input.total_num_scheduled_tokens
+            - num_step_prefill_tokens)
+
         # 执行模型并采样新 token
-        token_ids = self.model_runner.call("run", seqs, is_prefill)
+        token_ids = self.model_runner.call("run", unified_model_runner_input)
+
+        # 记录本轮采样 token
+        sampled_tokens = [
+            SampledTokenOutput(seq_id=seq.seq_id, token_id=token_id)
+            for seq, token_id, should_sample in zip(
+                seqs, token_ids, unified_model_runner_input.should_sample,
+                strict=True
+            )
+            if should_sample
+        ]
+
         # 更新 Sequence 状态
-        self.scheduler.postprocess(scheduler_output, token_ids)
+        self.scheduler.postprocess(raw_scheduler_output, token_ids)
+
+        # postprocess 之后收集完成请求
+        finished_requests = [
+            FinishedRequestOutput(
+                seq_id=seq.seq_id,
+                final_completion_token_ids=seq.completion_token_ids,
+            )
+            for seq in seqs
+            if seq.is_finished
+        ]
+
         if self.stats is not None:
             block_manager = self.scheduler.block_manager
             self.stats.record_step(
                 start_time=step_start_time,
-                is_prefill=is_prefill,
                 num_seqs=len(seqs),
-                num_tokens=num_step_tokens,
+                num_prefill_tokens=num_step_prefill_tokens,
+                num_decode_tokens=num_step_decode_tokens,
                 # 快照口径固定为 postprocess 完成后的物理 KV Block 状态。
                 used_kv_blocks=len(block_manager.used_block_ids),
                 free_kv_blocks=len(block_manager.free_block_ids),
             )
-        # 返回本轮刚完成的请求
-        outputs = [(seq.seq_id, seq.completion_token_ids) for seq in seqs if seq.is_finished]
-        # 保留旧返回约定：Prefill 为正、Decode 为负，供 generate() 区分进度条吞吐。
-        returned_num_tokens = num_step_tokens if is_prefill else -num_step_tokens
-        return outputs, returned_num_tokens
+
+        return EngineStepOutput(
+            finished_requests=finished_requests,
+            sampled_tokens=sampled_tokens,
+            num_step_prefill_tokens=num_step_prefill_tokens,
+            num_step_decode_tokens=num_step_decode_tokens,
+        )
 
     # 判断所有请求是否结束
     def is_finished(self):
@@ -151,17 +187,26 @@ class LLMEngine:
         while not self.is_finished():
             t = perf_counter()
             # 调度一次
-            output, num_tokens = self.step()
-            if num_tokens > 0:
-                prefill_throughput = num_tokens / (perf_counter() - t)
-            else:
-                decode_throughput = -num_tokens / (perf_counter() - t)
+            step_output = self.step()
+
+            elapsed = perf_counter() - t
+
+            if step_output.num_step_prefill_tokens > 0:
+                prefill_throughput = (
+                    step_output.num_step_prefill_tokens / elapsed
+                )
+            if step_output.num_step_decode_tokens > 0:
+                decode_throughput = (
+                    step_output.num_step_decode_tokens / elapsed
+                )
             pbar.set_postfix({
                 "Prefill": f"{int(prefill_throughput)}tok/s",
                 "Decode": f"{int(decode_throughput)}tok/s",
             })
-            for seq_id, token_ids in output:
-                outputs[seq_id] = token_ids
+            for request_output in step_output.finished_requests:
+                outputs[request_output.seq_id] = (
+                    request_output.final_completion_token_ids
+                )
                 pbar.update(1)
         pbar.close()
         outputs = [outputs[seq_id] for seq_id in sorted(outputs.keys())]

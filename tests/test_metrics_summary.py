@@ -83,8 +83,9 @@ def test_engine_summary_collects_request_samples_without_inventing_missing_value
 
 
 # 场景：两个请求带有不同的抢占、重算和 Prefix Hit 累计值，同时构造两轮 Prefill
-# 和三轮 Decode Step。验证请求事件使用求和汇总，Step 耗时按 Prefill/Decode 分开
-# 计算百分位，并从所有 Step 的 postprocess 后快照中取出 peak_used_kv_blocks=4。
+# 三轮 Decode Step 和一轮 Mixed Step。验证请求事件使用求和汇总，Step 耗时按
+# Prefill/Decode/Mixed 分开计算百分位，并从所有 Step 的 postprocess 后快照中
+# 取出 peak_used_kv_blocks=4。
 def test_engine_summary_sums_cache_events_and_separates_step_types():
     stats = EngineStats()
     stats.requests = {
@@ -112,22 +113,26 @@ def test_engine_summary_sums_cache_events_and_separates_step_types():
         ),
     }
     stats.steps = [
-        StepMetrics(0.0, 2.0, True, 1, 4, used_kv_blocks=1),
-        StepMetrics(2.0, 3.0, False, 1, 1, used_kv_blocks=4),
-        StepMetrics(3.0, 7.0, True, 1, 4, used_kv_blocks=3),
-        StepMetrics(7.0, 10.0, False, 2, 2, used_kv_blocks=2),
-        StepMetrics(10.0, 15.0, False, 1, 1, used_kv_blocks=2),
+        StepMetrics(0.0, 2.0, 1, 4, 0, used_kv_blocks=1),
+        StepMetrics(2.0, 3.0, 1, 0, 1, used_kv_blocks=4),
+        StepMetrics(3.0, 7.0, 1, 4, 0, used_kv_blocks=3),
+        StepMetrics(7.0, 10.0, 2, 0, 2, used_kv_blocks=2),
+        StepMetrics(10.0, 15.0, 1, 0, 1, used_kv_blocks=2),
+        StepMetrics(15.0, 17.0, 2, 3, 2, used_kv_blocks=3),
     ]
 
     summary = stats.summarize()
 
-    assert summary.step_count == 5
+    assert summary.step_count == 6
     assert summary.prefill_step_count == 2
     assert summary.decode_step_count == 3
+    assert summary.mixed_step_count == 1
     assert summary.prefill_step_duration.count == 2
     assert summary.prefill_step_duration.p50 == pytest.approx(3.0)
     assert summary.decode_step_duration.count == 3
     assert summary.decode_step_duration.p50 == pytest.approx(3.0)
+    assert summary.mixed_step_duration.count == 1
+    assert summary.mixed_step_duration.p50 == pytest.approx(2.0)
     assert summary.peak_used_kv_blocks == 4
     assert summary.total_preemptions == 3
     assert summary.total_preempted_cached_tokens == 16
@@ -159,9 +164,9 @@ def test_metrics_report_formats_internal_seconds_as_milliseconds():
         StepMetrics(
             start_time=0.0,
             end_time=0.003,
-            is_prefill=True,
             num_seqs=1,
-            num_tokens=4,
+            num_prefill_tokens=4,
+            num_decode_tokens=0,
             used_kv_blocks=3,
         )
     ]
@@ -172,6 +177,8 @@ def test_metrics_report_formats_internal_seconds_as_milliseconds():
     assert "TTFT (ms): count=1 P50=100.00 P95=100.00 P99=100.00" in report
     assert "ITL (ms): count=1 P50=20.00 P95=20.00 P99=20.00" in report
     assert "Prefill Step (ms): count=1 P50=3.00 P95=3.00 P99=3.00" in report
+    assert "Steps: 1 (prefill=1, decode=0, mixed=0)" in report
+    assert "Mixed Step (ms): count=0" in report
     assert "Preemptions: 1" in report
     assert "Recomputed tokens: 2" in report
     assert "Prefix hit tokens: 4" in report

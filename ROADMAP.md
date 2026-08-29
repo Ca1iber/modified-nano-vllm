@@ -9,9 +9,12 @@
 - 最新已完成检查点：P1.2c 按请求更新状态与采样边界。Unified Scheduler 已按每个
   Sequence 的实际计算区间推进缓存状态、判断采样边界，并通过 EOS/ignore_eos、
   Legacy/Unified 等价状态和 KV 资源释放回归；核心实现检查点为 `4525b78`。
-- 下一检查点：P1.2d 建立 Unified-first 执行契约。继续保留差异化的
-  `LegacySchedulerOutput` 与 `UnifiedSchedulerOutput`，但在 Scheduler/ModelRunner
-  边界将 Legacy 输出适配为 Unified 输出，使 ModelRunner 最终只维护 Unified 协议。
+- 当前进行中检查点：P1.2d Unified-first 执行契约。`SchedulerOutput.to_unified()`
+  转换契约已由 `86bd8fd` 建立；Engine 输出协议、Unified ModelRunner 入口、Mixed
+  StepMetrics 和 CPU fail-closed 回归已于 2026-08-30 闭环。全量 CPU 测试为
+  `123 passed, 14 skipped`，剩余动作是补跑真实 GPU 生成回归后完成 P1.2d 验收。
+- 下一开发检查点：P1.3 混合 Batch Metadata。在进入 P1.3 前不放宽 ModelRunner 的
+  Mixed fail-closed 限制，也不把 Scheduler 可表达 Mixed 误写成真实 Mixed forward。
 - 已完成 P0.3a RequestMetrics、P0.3b StepMetrics、P0.3c
   preemption/recompute 与 KV Cache 指标，以及 P0.3d 百分位汇总和 benchmark
   报告接口。
@@ -655,7 +658,7 @@ Sequence 本轮的计算区间判断：
 - 范围边界：P1.2c 只闭合 Scheduler 的逐请求状态和采样语义；Unified 执行契约与
   Legacy Output 适配属于 P1.2d，混合 metadata 属于 P1.3。
 
-#### `[ ]` P1.2d Unified 执行契约与 Legacy Output 适配
+#### `[~]` P1.2d Unified 执行契约与 Legacy Output 适配
 
 保留两种差异化 Scheduler 输出：
 
@@ -711,6 +714,38 @@ Scheduler.postprocess(raw_scheduler_output, token_ids)
 - Legacy 三种 P1.1 策略的最终 token、状态、KV Block 与现有基线一致；
 - 全量 CPU 测试与现有 GPU 生成正确性回归通过；GPU 不可用时必须明确 skip，不能静默
   省略。`git diff --check` 通过。
+
+P1.2d CPU 实现检查点（2026-08-30）：
+
+- 前置转换契约：`86bd8fd` 已为 `SchedulerOutput` 定义 `to_unified()`，验证 Unified
+  输出保持对象身份，Legacy 输出在不修改原对象和 Sequence 状态的前提下展开逐请求
+  `is_prefilling` 与 `should_sample`。
+- Engine 边界：`LLMEngine.step()` 保留原始 Scheduler 输出供 `postprocess()` 使用，
+  同时只把 `to_unified()` 后的执行协议交给 ModelRunner；Engine 不读取 Legacy
+  `is_prefill`，也不按具体 SchedulerOutput 类型分支。
+- Engine 返回协议：新增 `SampledTokenOutput`、`FinishedRequestOutput` 和
+  `EngineStepOutput`，分别表达本轮采样事件、本轮完成请求、Prefill/Decode token
+  组成；删除 Prefill 正数、Decode 负数的旧返回约定，`generate()` 已改为消费命名字段。
+- 采样与完成语义：`sampled_tokens` 在 `postprocess()` 前由逐请求 `should_sample`
+  过滤，Partial Prefill 的占位 token 不会泄漏；`finished_requests` 在状态提交后收集，
+  保存请求结束时的完整 completion token 快照。
+- ModelRunner 入口：`run()` 只接收 `UnifiedSchedulerOutput`，Warmup 同样构造 Unified
+  输入；纯 Prefill/纯 Decode 在内部临时复用旧 prepare 路径，Mixed Batch 在 P1.3/P1.4
+  完成前明确抛出 `NotImplementedError`，不误选任意同质执行路径。
+- Step 指标：`StepMetrics` 删除全局 `is_prefill`，改为保存
+  `num_prefill_tokens`/`num_decode_tokens`，并派生 total、Prefill-only、Decode-only 和
+  Mixed 语义；Engine 汇总新增 Mixed Step 数量与耗时，GPU workload 结果也改为输出
+  每轮两类 token 数。
+- 新增 CPU 回归：`tests/test_engine_step_output.py` 覆盖 Partial Prefill、Final Prefill、
+  Decode、Mixed token 组成、采样过滤和完成结果；`tests/test_model_runner_dispatch.py`
+  覆盖纯 Prefill、纯 Decode 和 Mixed fail-closed 三条分发路径。
+- 验证命令：`conda run -n nano-vllm bash tests/run.sh all -q`。
+- 验证结果：`123 passed, 14 skipped`；14 项均为需要显式 GPU 环境的测试；
+  `git diff --check` 通过。
+- 当前结论：P1.2d 的 CPU 实现、接口和错误边界已经闭环，但真实 Warmup、CUDA
+  Prefill/Decode、CUDA Graph 及 TP 共享内存传递尚未在本检查点重新执行，因此状态保持
+  `[~]`；真实 GPU 回归通过前不标记 `[x]`，真正 Mixed metadata/forward 仍属于
+  P1.3/P1.4。
 
 P1.2 总体验收：
 

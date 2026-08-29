@@ -4,7 +4,10 @@ import pytest
 
 from nanovllm.engine.llm_engine import LLMEngine
 from nanovllm.engine.scheduler import Scheduler
-from nanovllm.engine.scheduler_output import LegacySchedulerOutput
+from nanovllm.engine.scheduler_output import (
+    LegacySchedulerOutput,
+    UnifiedSchedulerOutput,
+)
 from nanovllm.engine.sequence import Sequence, SequenceStatus
 from nanovllm.engine.stats import EngineStats
 from nanovllm.sampling_params import SamplingParams
@@ -25,9 +28,10 @@ class FakeModelRunner:
     def __init__(self, token_id: int = 90):
         self.token_id = token_id
 
-    def call(self, method, seqs, is_prefill):
+    def call(self, method, scheduler_output):
         assert method == "run"
-        return [self.token_id] * len(seqs)
+        assert isinstance(scheduler_output, UnifiedSchedulerOutput)
+        return [self.token_id] * len(scheduler_output.scheduled_seqs)
 
 
 def make_scheduler(
@@ -161,11 +165,12 @@ def test_recompute_counts_only_previously_computed_uncached_tokens(
     scheduler.preempt(seq)
     engine = make_test_engine(scheduler, stats, token_id=91)
 
-    outputs, returned_num_tokens = engine.step()
+    step_output = engine.step()
 
     metrics = stats.requests[seq.seq_id]
-    assert outputs == []
-    assert returned_num_tokens == 3
+    assert step_output.finished_requests == []
+    assert step_output.num_step_prefill_tokens == 3
+    assert step_output.num_step_decode_tokens == 0
     assert metrics.prefix_hit_blocks == 1
     assert metrics.prefix_hit_tokens == 4
     assert metrics.recompute_steps == 1
@@ -174,7 +179,9 @@ def test_recompute_counts_only_previously_computed_uncached_tokens(
     assert seq.completion_token_ids == [90, 91]
 
     step = stats.steps[-1]
-    assert step.is_prefill is True
+    assert step.is_prefill_only is True
+    assert step.num_prefill_tokens == 3
+    assert step.num_decode_tokens == 0
     assert step.num_tokens == 3
     # 抢占发生在本轮开始前；本轮只记录恢复产生的 Prefix Hit 和 Recompute。
     assert step.num_preemptions == 0
@@ -241,16 +248,19 @@ def test_decode_step_records_automatic_preemption_and_kv_snapshot(
     assert len(scheduler.block_manager.free_block_ids) == 0
 
     engine = make_test_engine(scheduler, stats, token_id=92)
-    _, returned_num_tokens = engine.step()
+    step_output = engine.step()
 
     seq2_metrics = stats.requests[seq2.seq_id]
     step = stats.steps[-1]
-    assert returned_num_tokens == -1
+    assert step_output.num_step_prefill_tokens == 0
+    assert step_output.num_step_decode_tokens == 1
     assert seq2.status is SequenceStatus.WAITING
     assert seq2_metrics.preemption_count == 1
     assert seq2_metrics.preempted_cached_tokens == 4
     assert seq2_metrics.freed_physical_blocks == 1
-    assert step.is_prefill is False
+    assert step.is_decode_only is True
+    assert step.num_prefill_tokens == 0
+    assert step.num_decode_tokens == 1
     assert step.num_preemptions == 1
     assert step.num_recomputed_tokens == 0
     assert step.num_prefix_hit_tokens == 0
@@ -272,11 +282,15 @@ def test_step_kv_snapshot_is_taken_after_finished_request_releases_blocks(
     scheduler.add(seq)
     engine = make_test_engine(scheduler, stats, token_id=90)
 
-    outputs, returned_num_tokens = engine.step()
+    step_output = engine.step()
 
     step = stats.steps[-1]
-    assert outputs == [(seq.seq_id, [90])]
-    assert returned_num_tokens == 4
+    assert len(step_output.finished_requests) == 1
+    finished_request = step_output.finished_requests[0]
+    assert finished_request.seq_id == seq.seq_id
+    assert finished_request.final_completion_token_ids == [90]
+    assert step_output.num_step_prefill_tokens == 4
+    assert step_output.num_step_decode_tokens == 0
     assert seq.status is SequenceStatus.FINISHED
     assert step.used_kv_blocks == 0
     assert step.free_kv_blocks == 4
