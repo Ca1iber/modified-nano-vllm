@@ -46,6 +46,102 @@ def make_scheduler_config(**kwargs):
     return SimpleNamespace(**config)
 
 
+def test_unified_output_to_unified_returns_self():
+    seq = Sequence([10, 11], SamplingParams(max_tokens=1))
+    seq.num_scheduled_tokens = 2
+    output = UnifiedSchedulerOutput(
+        scheduled_seqs=[seq],
+        total_num_scheduled_tokens=2,
+        should_sample=[True],
+        is_prefilling=[True],
+    )
+
+    assert output.to_unified() is output
+
+
+@pytest.mark.parametrize(
+    (
+        "is_prefill",
+        "num_cached_tokens",
+        "num_scheduled_tokens",
+        "expected_should_sample",
+    ),
+    [
+        pytest.param(True, 0, 4, False, id="partial-prefill"),
+        pytest.param(True, 4, 2, True, id="final-prefill-chunk"),
+        pytest.param(False, 5, 1, True, id="decode"),
+    ],
+)
+def test_legacy_output_to_unified_maps_phase_and_sampling_boundary(
+    is_prefill: bool,
+    num_cached_tokens: int,
+    num_scheduled_tokens: int,
+    expected_should_sample: bool,
+):
+    token_ids = (
+        [10, 11, 12, 13, 14]
+        if not is_prefill
+        else [10, 11, 12, 13, 14, 15]
+    )
+    seq = Sequence(
+        token_ids,
+        SamplingParams(max_tokens=2),
+    )
+    if not is_prefill:
+        seq.append_token(15)
+    seq.num_cached_tokens = num_cached_tokens
+    seq.num_scheduled_tokens = num_scheduled_tokens
+    original_token_ids = list(seq.token_ids)
+    original_status = seq.status
+    output = LegacySchedulerOutput(
+        scheduled_seqs=[seq],
+        total_num_scheduled_tokens=num_scheduled_tokens,
+        is_prefill=is_prefill,
+    )
+
+    converted = output.to_unified()
+
+    assert converted is not output
+    assert converted.scheduled_seqs[0] is seq
+    assert converted.total_num_scheduled_tokens == num_scheduled_tokens
+    assert converted.is_prefilling == [is_prefill]
+    assert converted.should_sample == [expected_should_sample]
+    assert output.is_prefill is is_prefill
+    assert seq.num_cached_tokens == num_cached_tokens
+    assert seq.num_scheduled_tokens == num_scheduled_tokens
+    assert seq.token_ids == original_token_ids
+    assert seq.status is original_status
+
+
+def test_legacy_output_to_unified_keeps_per_request_sampling_boundaries():
+    partial_seq = Sequence(
+        [10, 11, 12, 13, 14, 15],
+        SamplingParams(max_tokens=1),
+    )
+    partial_seq.num_scheduled_tokens = 4
+    final_seq = Sequence(
+        [20, 21, 22, 23],
+        SamplingParams(max_tokens=1),
+    )
+    final_seq.num_scheduled_tokens = 4
+    output = LegacySchedulerOutput(
+        scheduled_seqs=[partial_seq, final_seq],
+        total_num_scheduled_tokens=8,
+        is_prefill=True,
+    )
+
+    converted = output.to_unified()
+
+    assert converted.scheduled_seqs == [partial_seq, final_seq]
+    assert converted.is_prefilling == [True, True]
+    assert converted.should_sample == [False, True]
+    assert (
+        len(converted.scheduled_seqs)
+        == len(converted.is_prefilling)
+        == len(converted.should_sample)
+    )
+
+
 def test_scheduler_defaults_to_legacy_mode():
     scheduler = Scheduler(make_scheduler_config())
     seq = Sequence([10, 11], SamplingParams(max_tokens=1))
