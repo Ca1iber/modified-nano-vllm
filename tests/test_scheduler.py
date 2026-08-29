@@ -537,6 +537,140 @@ def test_unified_finished_request_releases_all_kv_blocks(
     assert scheduler.is_finished() is True
 
 
+@pytest.mark.parametrize(
+    ("ignore_eos", "expected_status"),
+    [
+        (False, SequenceStatus.FINISHED),
+        (True, SequenceStatus.RUNNING),
+    ],
+)
+def test_unified_eos_respects_ignore_eos_and_kv_lifetime(
+    monkeypatch: pytest.MonkeyPatch,
+    ignore_eos: bool,
+    expected_status: SequenceStatus,
+):
+    """Unified EOS handling either releases or retains the request KV blocks."""
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    scheduler = Scheduler(
+        make_scheduler_config(
+            scheduler_mode="unified",
+            max_num_batched_tokens=block_size,
+            kvcache_block_size=block_size,
+            num_kvcache_blocks=4,
+        )
+    )
+    seq = Sequence(
+        token_ids=[10, 11, 12, 13],
+        sampling_params=SamplingParams(
+            max_tokens=5,
+            ignore_eos=ignore_eos,
+        ),
+    )
+    scheduler.add(seq)
+
+    prefill_output = schedule_unified(scheduler)
+    assert prefill_output.should_sample == [True]
+    scheduler.postprocess(prefill_output, token_ids=[90])
+
+    decode_output = schedule_unified(scheduler)
+    assert decode_output.is_prefilling == [False]
+    assert decode_output.should_sample == [True]
+    scheduler.postprocess(decode_output, token_ids=[99])
+
+    assert seq.completion_token_ids == [90, 99]
+    assert seq.num_completion_tokens < seq.max_tokens
+    assert seq.num_scheduled_tokens == 0
+    assert seq.status is expected_status
+
+    if ignore_eos:
+        allocated_block_ids = list(seq.block_table)
+        assert seq.num_cached_tokens == 5
+        assert list(scheduler.running) == [seq]
+        assert scheduler.is_finished() is False
+        assert scheduler.block_manager.used_block_ids == set(allocated_block_ids)
+        assert all(
+            scheduler.block_manager.blocks[block_id].ref_count == 1
+            for block_id in allocated_block_ids
+        )
+    else:
+        assert seq.num_cached_tokens == 0
+        assert seq.block_table == []
+        assert list(scheduler.running) == []
+        assert scheduler.is_finished() is True
+        assert scheduler.block_manager.used_block_ids == set()
+        assert all(
+            block.ref_count == 0
+            for block in scheduler.block_manager.blocks
+        )
+
+
+def test_unified_matches_legacy_final_state(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Equivalent Legacy and Unified runs produce the same terminal state."""
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+
+    def run_to_completion(scheduler_mode: str):
+        scheduler = Scheduler(
+            make_scheduler_config(
+                scheduler_mode=scheduler_mode,
+                max_num_batched_tokens=block_size,
+                kvcache_block_size=block_size,
+                num_kvcache_blocks=4,
+            )
+        )
+        seq = Sequence(
+            token_ids=[10, 11, 12, 13, 14, 15],
+            sampling_params=SamplingParams(max_tokens=3),
+        )
+        scheduler.add(seq)
+
+        num_steps = 0
+        while not scheduler.is_finished():
+            output = scheduler.schedule()
+            token_ids = [
+                90 + scheduled_seq.num_completion_tokens
+                for scheduled_seq in output.scheduled_seqs
+            ]
+            scheduler.postprocess(output, token_ids)
+            num_steps += 1
+            assert num_steps < 10
+
+        return {
+            "completion_token_ids": seq.completion_token_ids,
+            "status": seq.status,
+            "num_cached_tokens": seq.num_cached_tokens,
+            "num_scheduled_tokens": seq.num_scheduled_tokens,
+            "block_table": list(seq.block_table),
+            "waiting": list(scheduler.waiting),
+            "running": list(scheduler.running),
+            "used_block_ids": set(scheduler.block_manager.used_block_ids),
+            "num_free_blocks": len(scheduler.block_manager.free_block_ids),
+            "ref_counts": [
+                block.ref_count for block in scheduler.block_manager.blocks
+            ],
+        }
+
+    legacy_state = run_to_completion("legacy")
+    unified_state = run_to_completion("unified")
+
+    assert unified_state == legacy_state
+    assert unified_state == {
+        "completion_token_ids": [90, 91, 92],
+        "status": SequenceStatus.FINISHED,
+        "num_cached_tokens": 0,
+        "num_scheduled_tokens": 0,
+        "block_table": [],
+        "waiting": [],
+        "running": [],
+        "used_block_ids": set(),
+        "num_free_blocks": 4,
+        "ref_counts": [0, 0, 0, 0],
+    }
+
+
 def test_unified_preemption_skips_waiting_and_prioritizes_victim(
     monkeypatch: pytest.MonkeyPatch,
 ):

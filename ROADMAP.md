@@ -6,11 +6,9 @@
 ## 当前进度
 
 - 初始个人开发基线：`1655bdc`（2026-07-29 创建的无父节点 `Initial commit`）。
-- 最新已完成检查点：P1.2b 统一候选与 Token Budget 分配。Unified Scheduler 已能在
-  一个调度计划中为 running/waiting 请求分别分配 token，并按本轮实际 token 数申请
-  KV Block；实现检查点为 `9fcdb92`，边界测试检查点为 `eb75e7f`。
-- P1.2c 按请求更新状态与采样边界正在进行：`_postprocess_unified()` 的核心状态闭环已
-  实现，下一步补齐 Unified 模式的 EOS/ignore_eos 和等价状态回归后再标记完成。
+- 最新已完成检查点：P1.2c 按请求更新状态与采样边界。Unified Scheduler 已按每个
+  Sequence 的实际计算区间推进缓存状态、判断采样边界，并通过 EOS/ignore_eos、
+  Legacy/Unified 等价状态和 KV 资源释放回归；核心实现检查点为 `4525b78`。
 - 已完成 P0.3a RequestMetrics、P0.3b StepMetrics、P0.3c
   preemption/recompute 与 KV Cache 指标，以及 P0.3d 百分位汇总和 benchmark
   报告接口。
@@ -616,7 +614,7 @@ scheduled_tokens = min(pending_tokens, remaining_budget)
 - 范围边界：本阶段只产出可表达混合请求的 Scheduler 计划；ModelRunner/Attention
   仍未消费混合 metadata，也未执行真实混合 batch，这属于 P1.3/P1.4。
 
-#### `[~]` P1.2c 按请求更新状态与采样边界
+#### `[x]` P1.2c 按请求更新状态与采样边界
 
 删除 `postprocess(seqs, token_ids, is_prefill)` 对全局 phase 的依赖，改为根据每个
 Sequence 本轮的计算区间判断：
@@ -636,15 +634,23 @@ Sequence 本轮的计算区间判断：
   等价 legacy 调度的结果一致；
 - 所有完成请求的 block_table 清空且 `ref_count=0`。
 
-当前进度（2026-08-29）：
+完成证据（2026-08-29）：
 
 - `4525b78` 已实现 `_postprocess_unified()`：每个请求先推进本轮实际计算的
   `num_cached_tokens` 并清零 `num_scheduled_tokens`，再由 `should_sample` 决定是否
   接受输出 token；最后一个 Prefill chunk 会切换到 Decode。
 - 已有 CPU 测试覆盖 Partial Prefill、Prefill 完成采样、Decode、max_tokens、混合计划
   postprocess、Prefix Cache hash 和完成后 KV Block/ref_count 全释放。
-- 尚缺 Unified 模式下 EOS/ignore_eos 专项测试，以及与等价 legacy 状态闭环的对照测试；
-  补齐前保持 `[~]`，不提前标记完成。
+- `test_unified_eos_respects_ignore_eos_and_kv_lifetime` 参数化覆盖 EOS 提前结束和
+  `ignore_eos=True` 继续运行，并分别验证 KV Block 全释放或继续持有。
+- `test_unified_matches_legacy_final_state` 使用相同确定性 token 驱动两种模式完成
+  Chunked Prefill 与 Decode，验证最终 token、FINISHED 状态、队列、block table、
+  free/used 集合和全部 `ref_count` 一致。
+- 定向验证：新增 3 个测试实例全部通过；全量命令
+  `conda run -n nano-vllm bash tests/run.sh all -q`，结果为
+  `112 passed, 14 skipped`；`git diff --check` 通过。
+- 范围边界：P1.2c 只闭合 Scheduler 的逐请求状态和采样语义；Engine 对 Unified 输出的
+  消费、全局 `is_prefill` 兼容字段收敛属于 P1.2d，混合 metadata 属于 P1.3。
 
 #### `[ ]` P1.2d 兼容层与旧字段收敛
 
