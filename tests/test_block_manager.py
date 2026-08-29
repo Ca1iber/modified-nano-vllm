@@ -316,3 +316,50 @@ def test_can_allocate_returns_false_without_changing_state(
     assert manager.used_block_ids == set()
     assert list(manager.free_block_ids) == [0]
     assert manager.blocks[0].ref_count == 0
+
+
+def test_prefix_hit_capacity_failure_does_not_change_state(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A failed prefix-hit admission leaves cache ownership unchanged."""
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    manager = BlockManager(num_blocks=2, block_size=block_size)
+
+    cached_seq = Sequence(
+        token_ids=[10, 11, 12, 13, 14],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    manager.allocate(cached_seq)
+    cached_seq.num_scheduled_tokens = block_size
+    manager.hash_blocks(cached_seq)
+    shared_block_id = cached_seq.block_table[0]
+    shared_block_hash = manager.blocks[shared_block_id].hash
+    cached_seq.num_cached_tokens += cached_seq.num_scheduled_tokens
+    cached_seq.num_scheduled_tokens = 0
+    manager.deallocate(cached_seq)
+
+    # 占用非 prefix block，只留下命中的 block；目标请求仍缺一个 suffix block。
+    holder = Sequence(
+        token_ids=[30, 31, 32, 33],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    manager.allocate(holder)
+    assert list(manager.free_block_ids) == [shared_block_id]
+
+    target = Sequence(
+        token_ids=[10, 11, 12, 13, 20, 21, 22, 23],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    free_before = list(manager.free_block_ids)
+    used_before = set(manager.used_block_ids)
+    ref_counts_before = [block.ref_count for block in manager.blocks]
+
+    assert manager.get_num_cached_blocks(target) == 1
+    assert manager.can_allocate(target, num_new_tokens=block_size) is False
+    assert target.block_table == []
+    assert target.num_cached_tokens == 0
+    assert list(manager.free_block_ids) == free_before
+    assert manager.used_block_ids == used_before
+    assert [block.ref_count for block in manager.blocks] == ref_counts_before
+    assert manager.hash_to_block_id[shared_block_hash] == shared_block_id

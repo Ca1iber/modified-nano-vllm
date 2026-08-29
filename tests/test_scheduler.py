@@ -186,6 +186,131 @@ def test_unified_prefix_cache_hit_schedules_only_uncached_suffix(
     assert scheduler.block_manager.hash_to_block_id[suffix_block_hash] == suffix_block_id
 
 
+def test_unified_prefix_hit_partial_chunk_allocates_only_current_slots(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    scheduler = Scheduler(
+        make_scheduler_config(
+            scheduler_mode="unified",
+            max_num_batched_tokens=3,
+            kvcache_block_size=block_size,
+            num_kvcache_blocks=4,
+        )
+    )
+
+    cached_seq = Sequence(
+        token_ids=[10, 11, 12, 13, 14],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    scheduler.block_manager.allocate(cached_seq)
+    cached_seq.num_scheduled_tokens = block_size
+    scheduler.block_manager.hash_blocks(cached_seq)
+    shared_block_id = cached_seq.block_table[0]
+    cached_seq.num_cached_tokens += cached_seq.num_scheduled_tokens
+    cached_seq.num_scheduled_tokens = 0
+    scheduler.block_manager.deallocate(cached_seq)
+
+    seq = Sequence(
+        token_ids=[10, 11, 12, 13, 20, 21, 22, 23, 30, 31, 32, 33],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    scheduler.add(seq)
+
+    output = schedule_unified(scheduler)
+
+    assert output.scheduled_seqs == [seq]
+    assert output.total_num_scheduled_tokens == 3
+    assert output.is_prefilling == [True]
+    assert output.should_sample == [False]
+    assert seq.num_cached_tokens == block_size
+    assert seq.num_scheduled_tokens == 3
+    assert len(seq.block_table) == 2
+    assert seq.block_table[0] == shared_block_id
+    assert list(scheduler.waiting) == []
+    assert list(scheduler.running) == [seq]
+
+
+def test_unified_skips_unallocatable_waiter_and_schedules_later_request(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    scheduler = Scheduler(
+        make_scheduler_config(
+            scheduler_mode="unified",
+            max_num_batched_tokens=8,
+            kvcache_block_size=block_size,
+            num_kvcache_blocks=1,
+        )
+    )
+    blocked_seq = Sequence(
+        token_ids=[10, 11, 12, 13, 14, 15, 16, 17],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    schedulable_seq = Sequence(
+        token_ids=[20, 21, 22, 23],
+        sampling_params=SamplingParams(max_tokens=1),
+    )
+    scheduler.add(blocked_seq)
+    scheduler.add(schedulable_seq)
+
+    output = schedule_unified(scheduler)
+
+    assert output.scheduled_seqs == [schedulable_seq]
+    assert output.total_num_scheduled_tokens == block_size
+    assert blocked_seq.status is SequenceStatus.WAITING
+    assert blocked_seq.block_table == []
+    assert blocked_seq.num_cached_tokens == 0
+    assert blocked_seq.num_scheduled_tokens == 0
+    assert list(scheduler.waiting) == [blocked_seq]
+    assert schedulable_seq.status is SequenceStatus.RUNNING
+    assert len(schedulable_seq.block_table) == 1
+    assert list(scheduler.running) == [schedulable_seq]
+
+
+def test_unified_chunk_allocates_next_block_only_after_crossing_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    block_size = 4
+    monkeypatch.setattr(Sequence, "block_size", block_size)
+    scheduler = Scheduler(
+        make_scheduler_config(
+            scheduler_mode="unified",
+            max_num_batched_tokens=2,
+            kvcache_block_size=block_size,
+            num_kvcache_blocks=3,
+        )
+    )
+    seq = Sequence(
+        token_ids=[10, 11, 12, 13, 14, 15],
+        sampling_params=SamplingParams(max_tokens=2),
+    )
+    scheduler.add(seq)
+
+    first_output = schedule_unified(scheduler)
+    assert first_output.total_num_scheduled_tokens == 2
+    assert first_output.should_sample == [False]
+    assert len(seq.block_table) == 1
+    scheduler.postprocess(first_output, token_ids=[90])
+    assert seq.num_cached_tokens == 2
+    assert len(seq.block_table) == 1
+
+    second_output = schedule_unified(scheduler)
+    assert second_output.total_num_scheduled_tokens == 2
+    assert second_output.should_sample == [False]
+    assert len(seq.block_table) == 1
+    scheduler.postprocess(second_output, token_ids=[91])
+    assert seq.num_cached_tokens == block_size
+    assert len(seq.block_table) == 1
+
+    third_output = schedule_unified(scheduler)
+    assert third_output.total_num_scheduled_tokens == 2
+    assert third_output.should_sample == [True]
+    assert len(seq.block_table) == 2
+
+
 def test_unified_admits_waiting_prefill_after_running_decode(
     monkeypatch: pytest.MonkeyPatch,
 ):
