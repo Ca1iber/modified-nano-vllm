@@ -6,8 +6,11 @@
 ## 当前进度
 
 - 初始个人开发基线：`1655bdc`（2026-07-29 创建的无父节点 `Initial commit`）。
-- 最新已提交检查点：P1.2a SchedulerOutput 调度接口（`2970b37`）。当前实现仍保留
-  “一个 Step 只能是 Prefill 或 Decode”的教学简化，下一步进入 P1.2b 统一 token 调度。
+- 最新已完成检查点：P1.2b 统一候选与 Token Budget 分配。Unified Scheduler 已能在
+  一个调度计划中为 running/waiting 请求分别分配 token，并按本轮实际 token 数申请
+  KV Block；实现检查点为 `9fcdb92`，边界测试检查点为 `eb75e7f`。
+- P1.2c 按请求更新状态与采样边界正在进行：`_postprocess_unified()` 的核心状态闭环已
+  实现，下一步补齐 Unified 模式的 EOS/ignore_eos 和等价状态回归后再标记完成。
 - 已完成 P0.3a RequestMetrics、P0.3b StepMetrics、P0.3c
   preemption/recompute 与 KV Cache 指标，以及 P0.3d 百分位汇总和 benchmark
   报告接口。
@@ -16,7 +19,8 @@
   对照因长期只有单 GPU 标记为受阻的分布式扩展项，不纳入本轮验收。
 - P0.4 可复现 workload 已完成：六场景 GPU pytest 全部通过；修复预热 seed 的
   Prefix Cache 污染后，独立进程 suite 已完成一次预热、三轮正式测试并生成
-  valid Markdown/JSON 基线；P1.1 Scheduler 策略和 P1.2a SchedulerOutput 接口已完成。
+  valid Markdown/JSON 基线；P1.1 Scheduler 策略、P1.2a SchedulerOutput 接口和
+  P1.2b 统一 token 调度计划已完成。
 - 顺序调整：按 2026-08-01 的决定先完成 P0.3，P0.2 GPU 正确性测试仍保留在计划中。
 - 当前定位：约 1200 行的离线推理教学实现，不以完整复刻生产 vLLM 为目标。
 
@@ -525,20 +529,25 @@ P0.4e 完成证据：
 @dataclass(slots=True)
 class SchedulerOutput:
     scheduled_seqs: list[Sequence]
-    num_scheduled_tokens: dict[int, int]
     total_num_scheduled_tokens: int
 
 
 @dataclass(slots=True)
 class LegacySchedulerOutput(SchedulerOutput):
     is_prefill: bool
+
+
+@dataclass(slots=True)
+class UnifiedSchedulerOutput(SchedulerOutput):
+    should_sample: list[bool]
+    is_prefilling: list[bool]
 ```
 
 要求：
 
-- `seq.num_scheduled_tokens` 与输出中的对应值保持一致。
-- `num_scheduled_tokens` 为正整数，且未调度的 Sequence 必须为 0。
+- 被调度请求的 `seq.num_scheduled_tokens` 为正整数，未调度请求必须为 0。
 - `total_num_scheduled_tokens` 不超过 token budget。
+- Unified 输出中的 `scheduled_seqs`、`should_sample` 和 `is_prefilling` 按位置一一对应。
 - 暂时保留 P1.1 的纯 Prefill/纯 Decode 执行路径，旧的 `is_prefill` 只作为兼容适配值。
 
 验收：
@@ -549,21 +558,25 @@ class LegacySchedulerOutput(SchedulerOutput):
 完成证据（2026-08-26）：
 
 - `Scheduler.schedule()` 已返回 `LegacySchedulerOutput`；`is_prefill` 作为兼容字段保留，
-  `scheduled_seqs`、每请求 `num_scheduled_tokens` 和总 token 数显式传递给 Engine。
+  `scheduled_seqs`、Sequence 上的 `num_scheduled_tokens` 和总 token 数显式传递给 Engine。
 - `LLMEngine.step()`、Scheduler、Request Metrics、Cache Metrics 和 Step Metrics 测试已迁移到新对象接口。
 - Commit：`2970b37`（`重构：引入 SchedulerOutput 调度接口`）。
 - 验证：`conda run -n nano-vllm bash tests/run.sh all -q`，结果为 `92 passed, 14 skipped`；
   `git diff --check` 通过。
+- 后续在 `b9ef6c6` 中删除了 SchedulerOutput 内与 Sequence 状态重复的 token 字典；
+  `UnifiedSchedulerOutput` 增加逐请求 `should_sample` 和 `is_prefilling` 列表。
 - 范围边界：本项没有删除全局 `is_prefill`，也没有实现混合 Prefill/Decode；这些属于
   后续 P1.2b～P1.4。
 
-#### P1.2b 统一候选与 Token Budget 分配
+#### `[x]` P1.2b 统一候选与 Token Budget 分配
 
-将 `waiting` 和 `running` 转换为本轮的调度候选顺序。P1.1 的策略只负责排序：
+将 `waiting` 和 `running` 转换为本轮的调度候选顺序。当前两种模式的职责为：
 
-- `prefill_first`：waiting 候选优先；
-- `decode_first`：running 候选优先；
-- `time_sliced`：根据最近的连续调度量调整优先级。
+- Legacy 模式继续保留 P1.1 的 `prefill_first`、`decode_first` 和 `time_sliced`，作为
+  分阶段执行的性能基线；
+- Unified 模式采用 running 优先、waiting 随后的固定顺序，不再构造全局
+  Prefill/Decode phase；
+- running 阶段发生抢占时，本轮不再调度 waiting，避免刚释放的 KV Block 被新请求抢走。
 
 对每个候选请求计算：
 
@@ -585,7 +598,25 @@ scheduled_tokens = min(pending_tokens, remaining_budget)
   输出，不执行真实混合 Attention。
 - 验证 token budget、KV block、Prefix Cache、抢占和资源释放不变量。
 
-#### P1.2c 按请求更新状态与采样边界
+完成证据（2026-08-29）：
+
+- `Scheduler.schedule()` 可通过 `scheduler_mode` 在 legacy/unified 路径间分发；Unified
+  路径逐请求计算 `num_scheduled_tokens`，同一计划可同时包含 running Decode 和
+  waiting/Chunked Prefill，并保证总 token 数不超过 budget 和 `max_num_seqs`。
+- waiting 请求首次调度时先查询 Prefix Cache；`BlockManager.allocate()` 和
+  `allocate_slots()` 均按本轮实际 token 数分配物理 Block，不再为未调度的 Prompt
+  后缀提前占用容量。
+- KV 容量不足的 waiting 请求会被安全跳过，后续可调度请求仍可进入本轮；失败检查不会
+  改变 block table、free/used 集合、ref_count 或 Prefix Cache hash 所有权。
+- CPU 测试覆盖混合 running/waiting、不同 token 数、Chunked Prefill 跨 Block、
+  Prefix Cache 命中、容量不足、抢占和资源释放。主要实现 Commit：`b59b292`、
+  `b68855e`、`ddf5908`、`ac36128`、`9fcdb92`；测试检查点：`4607f5a`、`eb75e7f`。
+- 验证：`conda run -n nano-vllm bash tests/run.sh all -q`，结果为
+  `109 passed, 14 skipped`；4 项新增边界测试通过，`git diff --check` 通过。
+- 范围边界：本阶段只产出可表达混合请求的 Scheduler 计划；ModelRunner/Attention
+  仍未消费混合 metadata，也未执行真实混合 batch，这属于 P1.3/P1.4。
+
+#### `[~]` P1.2c 按请求更新状态与采样边界
 
 删除 `postprocess(seqs, token_ids, is_prefill)` 对全局 phase 的依赖，改为根据每个
 Sequence 本轮的计算区间判断：
@@ -601,10 +632,21 @@ Sequence 本轮的计算区间判断：
 验收：
 
 - Partial Prefill、Prefill 完成、Decode、EOS 和 max_tokens 边界测试通过；
-- 三种 P1.1 策略最终 token 序列完全一致；
+- Legacy 三种 P1.1 策略继续保持最终 token、状态和 KV 资源一致；Unified 状态机与
+  等价 legacy 调度的结果一致；
 - 所有完成请求的 block_table 清空且 `ref_count=0`。
 
-#### P1.2d 兼容层与旧字段收敛
+当前进度（2026-08-29）：
+
+- `4525b78` 已实现 `_postprocess_unified()`：每个请求先推进本轮实际计算的
+  `num_cached_tokens` 并清零 `num_scheduled_tokens`，再由 `should_sample` 决定是否
+  接受输出 token；最后一个 Prefill chunk 会切换到 Decode。
+- 已有 CPU 测试覆盖 Partial Prefill、Prefill 完成采样、Decode、max_tokens、混合计划
+  postprocess、Prefix Cache hash 和完成后 KV Block/ref_count 全释放。
+- 尚缺 Unified 模式下 EOS/ignore_eos 专项测试，以及与等价 legacy 状态闭环的对照测试；
+  补齐前保持 `[~]`，不提前标记完成。
+
+#### `[ ]` P1.2d 兼容层与旧字段收敛
 
 在 SchedulerOutput 和 per-request 状态稳定后，再逐步移除：
 
