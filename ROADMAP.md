@@ -13,8 +13,9 @@
   转换契约已由 `86bd8fd` 建立；Engine 输出协议、Unified ModelRunner 入口、Mixed
   StepMetrics 和 CPU fail-closed 回归已于 2026-08-30 闭环。全量 CPU 测试为
   `123 passed, 14 skipped`，剩余动作是补跑真实 GPU 生成回归后完成 P1.2d 验收。
-- 下一开发检查点：P1.3 混合 Batch Metadata。在进入 P1.3 前不放宽 ModelRunner 的
-  Mixed fail-closed 限制，也不把 Scheduler 可表达 Mixed 误写成真实 Mixed forward。
+- 当前开发检查点：P1.3a Unified Prepared Batch 契约。P1.2d 的真实 GPU 验收仍可
+  独立补跑，但不阻塞 P1.3 的 CPU metadata 开发；在 P1.4 前不放宽 ModelRunner 的
+  Mixed fail-closed 限制，也不把“能够构造 Mixed metadata”误写成真实 Mixed forward。
 - 已完成 P0.3a RequestMetrics、P0.3b StepMetrics、P0.3c
   preemption/recompute 与 KV Cache 指标，以及 P0.3d 百分位汇总和 benchmark
   报告接口。
@@ -756,55 +757,134 @@ P1.2 总体验收：
 - 长 Chunked Prefill 不得永久占用 budget；暂时无法分配 KV block 的请求不能无条件阻塞
   后续可调度请求。这些是验收风险，不单独形成调度架构。
 
-### `[ ]` P1.3 混合 Batch Metadata
+### `[~]` P1.3 混合 Batch Metadata
 
 目标：让 ModelRunner 以 `UnifiedSchedulerOutput` 为规范输入，接收每请求不同的 query
 length，而不是依赖全局 `is_prefill` 在 `prepare_prefill` 与 `prepare_decode` 之间二选一。
 Legacy 输出只通过 P1.2d 的适配器进入这条统一 metadata 路径，ModelRunner 不直接识别
 `LegacySchedulerOutput`。
 
-实现一个统一的 `prepare_unified()`（最终名称可微调），而不是长期并列维护
-`prepare_prefill()`、`prepare_decode()` 和只处理混合请求的 `prepare_mix()`。该入口应同时
-覆盖纯 Prefill、纯 Decode 与 Mixed Batch；旧的两个 prepare 方法可以在迁移期间作为
-实现参考或兼容 helper，待统一路径通过正确性验证后再收敛。
+拆分记录（2026-09-05）：P1.3 按契约、Query 计划、KV/Attention 计划、Tensor/Context
+边界和 ModelRunner 接入五个可独立验收的检查点推进。
 
-需要统一表达：
+本地 vLLM v0.27.1 的参照边界：
 
-- `num_scheduled_tokens`：每个请求本轮计算的 token 数。
-- `query_start_loc` 或等价的 ragged batch 边界。
-- 每个请求的 `num_computed_tokens`、context length、block table 和 slot mapping。
-- `sample_indices` 或等价信息：只从 `should_sample=True` 的请求位置获取有效输出。
-- 哪些 query 行仍处于 Prefill，哪些 query 行属于 Decode；该信息用于构造 metadata，
-  不再恢复成整个 Step 共用的 phase。
+- `vllm/v1/worker/gpu_model_runner.py::_prepare_inputs()` 根据逐请求
+  `num_scheduled_tokens` 构造扁平
+  `input_ids`、`positions` 和 `query_start_loc`，再将最后一个 query 位置作为 logits
+  候选位置；Partial Prefill 的无效采样结果由单独 mask 丢弃。
+- `vllm/v1/attention/backend.py::CommonAttentionMetadata` 保存 `query_start_loc`、
+  `seq_lens`、`block_table_tensor`、`slot_mapping` 等通用 Attention metadata。
+- nano-vLLM 只借鉴“逐请求计数 -> 扁平 query -> Attention metadata -> logits 选择”的
+  数据流，不复制 vLLM 为异步调度、Speculative Decode、多模态、LoRA 和 buffer 复用增加的
+  `InputBatch` 复杂度。
 
-对扁平 query，`query_start_loc` 由每请求 `num_scheduled_tokens` 的前缀和构造。例如：
+#### `[ ]` P1.3a Unified Prepared Batch 契约
+
+先定义 Scheduler 计划转换成 ModelRunner 执行输入后的正式数据边界，文档暂称
+`PreparedBatch`，最终类名和文件位置在本子项确定。它与 `UnifiedSchedulerOutput` 的职责
+不同：前者描述已经扁平化、可供模型执行的 Batch，后者仍描述逐请求调度决策。
+
+本子项必须先确定：
+
+- `prepare_unified()` 的输入、返回对象和失败语义；
+- host 侧计划与 device Tensor 是否使用同一个对象，以及对象由谁创建和释放；
+- `input_ids`、`positions`、`query_start_loc`、每请求最终 `seq_lens`、`slot_mapping`、
+  `block_tables`、`is_prefilling` 和采样位置的名称、shape、dtype 与长度不变量；
+- ModelRunner 返回紧凑采样结果还是与 `scheduled_seqs` 按请求对齐的结果，以及
+  `should_sample=False` 如何表示；
+- Mixed metadata 可以构造，但 P1.4 前不得进入 Attention forward。
+
+验收：
+
+- 用一张字段表或 dataclass 明确正式契约及每个字段的消费者；
+- 明确 `sum(query_lens) == total_num_scheduled_tokens`、
+  `len(query_start_loc) == num_reqs + 1` 等基本不变量；
+- 测试只面向本子项确定的正式接口，不为方便测试擅自引入 `_build_*` 私有 helper；
+- 不修改 Scheduler 状态，不改变现有 Prefill/Decode 执行结果。
+
+#### `[ ]` P1.3b Query 扁平化与采样计划
+
+按照 `scheduled_seqs` 顺序，将每个请求区间
+`[num_cached_tokens, num_cached_tokens + num_scheduled_tokens)` 拼成一个扁平 query，构造：
+
+- `input_ids`：本轮真正参与计算的 token；
+- `positions`：每个 token 在原 Sequence 中的逻辑位置；
+- `query_start_loc`：逐请求 query length 的前缀和；
+- 采样位置及其请求对应关系，只允许 `should_sample=True` 的请求产生有效采样结果。
+
+手算基准：
 
 ```text
 num_scheduled_tokens = [1, 3, 2]
 query_start_loc       = [0, 1, 4, 6]
 should_sample         = [True, False, True]
-sample_indices        = [0, 5]
+有效 logits 位置      = [0, 5]
 ```
-
-`sample_indices` 是紧凑列表，指向每个需要采样请求的最后一个 query 行，其长度等于
-`should_sample=True` 的请求数。ModelRunner 的采样结果必须保留与 `scheduled_seqs` 的明确
-对应关系：若返回按请求对齐的 `sampled_token_ids`，则其长度与请求数一致，
-`should_sample=False` 的位置使用 `None`；也可以返回紧凑 token 列表并附带对应的 `seq_id`
-或采用等价的 `seq_id -> token_id` 映射。无论采用哪种表示，postprocess 都必须推进所有
-已执行请求的 `num_cached_tokens`，不能因为某个请求本轮不采样而跳过它的计算进度更新。
 
 验收：
 
-- 纯 Prefill 和纯 Decode 继续通过现有正确性测试。
-- 至少覆盖一个 Decode 请求与一个 Chunked Prefill 请求同一 Step 的 metadata 构造。
-- Legacy 输出经适配后与等价 Unified 输出生成相同的 input token、position、query 边界、
-  slot mapping、block table 和采样位置。
-- `prepare_unified()` 对纯 Prefill、纯 Decode 和 Mixed 输入使用同一份 per-request 计数
-  语义；Mixed metadata 构造不再依赖同质 phase，但完整模型执行在 P1.4 前仍保持
-  fail closed。
-- `should_sample=False` 的请求不产生有效输出 token，但其本轮 cached token 进度仍正确提交。
-- 跨 block slot、Prefix Cache 和请求完成后的 ref_count 均正确。
-- 不以两个独立的 Engine step 冒充一个混合 Scheduler step。
+- CPU 测试分别覆盖纯 Prefill、纯 Decode、Partial/Final Prefill 和 Mixed Batch；
+- Mixed 用例同时验证扁平 `input_ids`、`positions`、query 边界与采样请求对应关系；
+- 不因 Partial Prefill 不采样而漏掉其 query token；
+- 构造过程只读取 Sequence 与 SchedulerOutput，不推进 `num_cached_tokens`，也不清零
+  `num_scheduled_tokens`。
+
+#### `[ ]` P1.3c KV 与 Attention Metadata 计划
+
+在同一份 Prepared Batch 中继续构造：
+
+- 每请求本轮结束后的 `seq_lens = num_cached_tokens + num_scheduled_tokens`；
+- 每个扁平 query token 对应的物理 `slot_mapping`；
+- 按请求补齐的 `block_tables`；
+- `max_query_len`、`max_seq_len` 以及 P1.4 区分 Attention 路径所需的逐请求 phase 信息。
+
+验收：
+
+- 手算验证从 block 中间开始、跨 block 结束和正好落在 block 边界三种 slot；
+- 覆盖 Decode、Chunked Prefill、Prefix Cache 命中前缀和 Mixed Batch；
+- `len(slot_mapping) == total_num_scheduled_tokens`，所有非 warmup slot 都能由
+  `block_table[logical_block_id] * block_size + offset` 推导；
+- metadata 构造不修改 block table、ref_count 或 free/used block 集合。
+
+#### `[ ]` P1.3d Tensor 化与 Context 边界
+
+将已验证的 host 侧 Prepared Batch 转换为 ModelRunner/Attention 需要的 Tensor，并扩展
+`Context` 使其能够携带统一 metadata。推荐保持当前 dtype 约定：token ID 和 position 使用
+`int64`，query 边界、sequence length、slot 与 block table 使用 `int32`。
+
+验收：
+
+- 纯 CPU 计划可以独立测试；Tensor 化集中在明确边界，不在字段构造过程中零散调用
+  `.cuda()`；
+- 纯 Prefill/Decode 生成的 Tensor 与旧 `prepare_prefill()`/`prepare_decode()` 在相同输入下
+  等价；
+- Mixed Prepared Batch 可以完成 Tensor 化，但当前 `Attention.forward()` 仍不得消费它；
+- 异常或 Mixed 拒绝后 `Context` 必须 reset，不能污染下一轮执行。
+
+#### `[ ]` P1.3e ModelRunner 接入与兼容验收
+
+让 `ModelRunner.run()` 的 metadata 准备统一经过 `prepare_unified()`。旧
+`prepare_prefill()`/`prepare_decode()` 可以在迁移期间作为对照 helper，验收完成后再决定
+删除或收敛为 wrapper；不得长期维护第三条仅处理 Mixed 的 `prepare_mix()`。
+
+验收：
+
+- Legacy 输出经 `to_unified()` 后与等价原生 Unified 输出生成相同 Prepared Batch；
+- 纯 Prefill、纯 Decode、Prefix Cache、Chunked Prefill、抢占恢复和 warmup 继续通过；
+- ModelRunner 的采样结果与 `scheduled_seqs` 保持明确对应，Partial Prefill 不产生可见 token，
+  但 Scheduler postprocess 仍推进其 cached token；
+- Mixed metadata 的独立构造测试通过，而 `run()` 在模型 forward 前继续明确 fail closed；
+- 全量 CPU 测试通过，真实 GPU Eager/CUDA Graph 回归通过；`git diff --check` 通过。
+
+P1.3 总体验收：
+
+- `prepare_unified()` 对纯 Prefill、纯 Decode 和 Mixed 输入使用同一套逐请求 token 计数；
+- Legacy/Unified 等价输入产生相同 input token、position、query 边界、slot、block table 和
+  采样位置；
+- 跨 block slot、Prefix Cache 和请求完成后的 ref_count 均保持正确；
+- 不以两个独立 Engine step 冒充一个 Mixed Scheduler step，也不在 P1.4 前宣称支持 Mixed
+  forward。
 
 ### `[ ]` P1.4 混合 Prefill/Decode 执行
 
